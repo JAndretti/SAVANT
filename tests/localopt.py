@@ -2,6 +2,8 @@
 """Exhaustive local optimum (relocate + swap + intra 2-opt + 2-opt*) computed
 naively in Python, to compare against the C annealer's descent."""
 import math, subprocess, sys
+
+from _paths import BIN            # noqa: F401  (also puts tools/ on sys.path)
 from check import read_bundle, cw_naive
 
 def cost(routes, d):
@@ -108,7 +110,7 @@ if __name__ == "__main__":
         R, d = cw_routes(n, cap, xs, ys, ds)
         c0 = cost(R, d)
         c1, _ = local_opt(R, ds, cap, d)
-        out = subprocess.run(["./cw", "--bundle", sys.argv[1], "--limit", str(k+1),
+        out = subprocess.run([BIN, "--bundle", sys.argv[1], "--limit", str(k+1),
                               "-q", "--sa-steps", "400000", "--t0", "1e-9", "--tend",
                               "1e-9", "--ops", "1,1,1", "--sa-knn", "0",
                               "--csv", "/tmp/d.csv"], capture_output=True, text=True)

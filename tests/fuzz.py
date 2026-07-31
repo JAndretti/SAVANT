@@ -19,16 +19,19 @@ import random
 import subprocess
 import sys
 
-BIN = "./cw_dbg" if "--asan" in sys.argv else "./cw"
+from _paths import BIN, BIN_DBG, DATA, EDGE, VALIDATE
+
+BIN = BIN_DBG if "--asan" in sys.argv else BIN
 N = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 200
 SLOW = BIN.endswith("dbg")
 
 SOURCES = [
-    ("--bundle " + f, os.path.basename(f)) for f in sorted(glob.glob("edge/*.cvrpb"))
+    ("--bundle " + f, os.path.basename(f))
+    for f in sorted(glob.glob(os.path.join(EDGE, "*.cvrpb")))
 ] + [
-    ("--bundle data/cvrp_20.cvrpb --limit 40", "cvrp20"),
-    ("--bundle data/cvrp_200.cvrpb --limit 12", "cvrp200"),
-    ("--dir data/cvrp_200 --limit 6", "dir200"),
+    (f"--bundle {DATA}/cvrp_20.cvrpb --limit 40", "cvrp20"),
+    (f"--bundle {DATA}/cvrp_200.cvrpb --limit 12", "cvrp200"),
+    (f"--dir {DATA}/cvrp_200 --limit 6", "dir200"),
 ]
 
 
@@ -100,7 +103,6 @@ def main():
         # exit code 2 is legitimate if the instance really is infeasible
         infeas = False
         if p.returncode == 2 and os.path.exists("/tmp/fz.cvrpb"):
-            sys.path.insert(0, ".")
             from validate import read_bundle
 
             infeas = any(
@@ -115,7 +117,7 @@ def main():
             why.append("stderr: " + p.stderr.strip()[:200])
         if ok:
             v = subprocess.run(
-                ["python3", "validate.py", "/tmp/fz.cvrpb", "/tmp/fz.txt"],
+                ["python3", VALIDATE, "/tmp/fz.cvrpb", "/tmp/fz.txt"],
                 capture_output=True,
                 text=True,
             )

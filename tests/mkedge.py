@@ -4,6 +4,8 @@
 sizes, degenerate geometries, pathological capacities."""
 import struct, sys, os, random
 
+from _paths import EDGE
+
 def write(path, insts):
     with open(path, "wb") as f:
         f.write(b"CVRPBIN1")
@@ -72,7 +74,7 @@ cases["huge"] = [inst(n, 30, [1e6 * v for v in xs], [1e6 * v for v in ys],
 xs2 = list(xs); ys2 = list(ys); xs2[1] = xs2[0]; ys2[1] = ys2[0]
 cases["depotdup"] = [inst(n, 30, xs2, ys2, [0.0] + [3.0]*n)]
 
-out = sys.argv[1] if len(sys.argv) > 1 else "edge"
+out = sys.argv[1] if len(sys.argv) > 1 else EDGE
 os.makedirs(out, exist_ok=True)
 for name, insts in cases.items():
     write(os.path.join(out, name + ".cvrpb"), insts)

@@ -1,5 +1,8 @@
 [project]
-dependencies = []
+dependencies = [
+    "matplotlib>=3.11.1",
+    "numpy>=2.5.1",
+]
 description = "Add your description here"
 name = "SAVANT"
 readme = "README.md"

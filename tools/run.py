@@ -21,9 +21,9 @@ flags: FMA contraction alone is enough to make two binaries built from the
 same source diverge (see README, "Hot-path optimisation").
 
 Usage:
-    python3 run.py --bundle data/cvrp_100.cvrpb --sa-steps 1000000 --restarts 10
-    python3 run.py --name alpha_sweep --random -n 200 --sa-steps 50000
-    python3 run.py --dry-run --bundle data/cvrp_20.cvrpb
+    python3 tools/run.py --bundle data/cvrp_100.cvrpb --sa-steps 1000000 --restarts 10
+    python3 tools/run.py --name alpha_sweep --random -n 200 --sa-steps 50000
+    python3 tools/run.py --dry-run --bundle data/cvrp_20.cvrpb
 """
 
 import argparse
@@ -37,9 +37,10 @@ import shutil
 import subprocess
 import sys
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-BIN = os.path.join(HERE, "cw")
-RESULTS = os.path.join(HERE, "results")
+HERE = os.path.dirname(os.path.abspath(__file__))       # tools/
+ROOT = os.path.dirname(HERE)                            # repository root
+BIN = os.path.join(ROOT, "cw")
+RESULTS = os.path.join(ROOT, "results")
 
 INJECTED = ("--csv", "--sol", "--dump-bundle")
 
@@ -82,7 +83,7 @@ def binary_fingerprint(path):
             digest = hashlib.md5(f.read()).hexdigest()
         st = os.stat(path)
         return {
-            "path": os.path.relpath(path, HERE),
+            "path": os.path.relpath(path, ROOT),
             "md5": digest,
             "size": st.st_size,
             "mtime": _dt.datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds"),

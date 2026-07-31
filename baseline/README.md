@@ -1,0 +1,102 @@
+# `baseline/` — published reference results
+
+Objectives, gaps and runtimes reported by other CVRP solvers, transcribed from
+tables 1 and 12 of
+
+> Ma, Y.; Cao, Z.; Chee, Y. M. *Learning to Search Feasible and Infeasible
+> Regions of Routing Problems with Flexible Neural k-Opt*, NeurIPS 2023
+> (arXiv:2310.18264).
+
+| file | role |
+|---|---|
+| `baseline.csv` | the data — the only thing here that is hand-maintained |
+| `make_tex.py` | generates `baseline.tex` from the CSV |
+| `baseline.tex` | generated: table + quality/time scatter |
+| `baseline.pdf` | built by `pdflatex baseline.tex` |
+
+`baseline.csv` is also read by `tools/validate.py`, which reports the gap between
+a run's mean cost and the HGS / LKH-3 objectives for the matching instance size.
+
+---
+
+## `baseline.csv`
+
+One row per method, 15 columns:
+
+| column | content |
+|---|---|
+| `method` | method name with its citation key, e.g. `HGS [21]` |
+| `model_type` | `H` (classical heuristic), `L2S/RL` (learn-to-search), `L2C/RL` (learn-to-construct) |
+| `post_proc` | per-instance post-processing: empty, `AS` (active search), `AS+BS` (+ beam search) |
+| `n{20,50,100}_obj` | mean objective |
+| `n{20,50,100}_gap_pct` | gap to HGS, **numeric percent** (`0.54`, not `"0.54%"`) |
+| `n{20,50,100}_time` | time as printed in the paper (`2.5d`, `28m`) |
+| `n{20,50,100}_time_h` | the same time in **hours**, numeric |
+
+Time is stored twice on purpose: the string keeps the file faithful to the
+source, the hours column makes it directly plottable. Gaps are numeric so pandas
+types them as floats. HGS's own gap cells are empty because it is the reference.
+Missing entries (Sym-NCO at n = 20/50, both SGBS rows) are empty cells, read as
+`NaN`.
+
+Method names contain commas and are therefore quoted — `"NeuOpt-GIRE (D2A=1,
+T=1k)"`. This matters (see below).
+
+**On the published gap values.** All 30 gaps agree with
+`(obj − HGS_obj)/HGS_obj` to within 0.008 percentage points, which confirms both
+the transcription and that the paper's gaps are relative to HGS. Four of them
+differ from the recomputed value in the second decimal because the paper rounds
+inconsistently — 0.617 is printed as `0.61` and 0.087 as `0.08` (truncated),
+while 0.033 is printed as `0.04` (rounded up). The published values are kept as
+printed, so the file can be cited.
+
+### Adding a size
+
+Add `n<N>_obj`, `n<N>_gap_pct`, `n<N>_time`, `n<N>_time_h` columns. Nothing else
+needs changing: `tools/validate.py` discovers sizes from the `n<N>_obj` column
+names, so an `n200_obj` column immediately makes CVRP-200 comparisons work.
+`make_tex.py` has a `SIZES` tuple to extend as well.
+
+---
+
+## `make_tex.py`
+
+```bash
+python3 baseline/make_tex.py                      # -> baseline/baseline.tex
+python3 baseline/make_tex.py in.csv out.tex
+cd baseline && pdflatex baseline.tex
+```
+
+Produces a landscape A4 document: a `booktabs` table with grouped `N=20/50/100`
+headers, and a three-panel `groupplot` of gap-to-HGS against time on a log axis,
+marker-coded by method family.
+
+**Why the `.tex` is generated rather than read live.** `pgfplotstable` does not
+implement RFC-4180 quoting, so a `\pgfplotstableread[col sep=comma]` would split
+`"NeuOpt-GIRE (D2A=1, T=1k)"` at the interior comma and silently shift every
+column after it. Generating the table with Python's `csv` module, which handles
+quoting correctly, makes that class of error impossible.
+
+Regenerate after any edit to `baseline.csv` — `baseline.tex` carries a
+do-not-edit header for that reason.
+
+Requires `booktabs`, `amssymb`, `xcolor`, `pgfplots` (≥ 1.18) and the
+`groupplots` library. Two non-obvious details, in case the template is edited:
+`mark size` is a TikZ key and needs the `/tikz/` prefix inside a pgfplots axis,
+and `\blacksquare` comes from `amssymb`.
+
+---
+
+## Where the solver sits
+
+For orientation, measured on this repository (12-core laptop, full 10 000
+instance CVRP-100 set):
+
+| configuration | cost | gap /HGS | wall time |
+|---|---:|---:|---:|
+| C&W alone | 16.49677 | +6.00 % | 0.1 s |
+| 200k steps, 1 restart | 16.01284 | +2.89 % | 5.8 s |
+| 1M steps, 10 restarts | 15.67949 | +0.75 % | 5.2 min |
+
+The time column is not a controlled comparison — the published figures come from
+different hardware — so treat it as indicative of order of magnitude only.

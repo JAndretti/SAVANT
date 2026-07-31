@@ -17,10 +17,10 @@ published references (HGS and LKH-3) read from baseline/baseline.csv, for the
 size n of the validated set.
 
 Usage:
-    python3 validate.py results/20260731-172744_N100_200k     # run directory
-    python3 validate.py data/cvrp_100.cvrpb solutions.txt      # explicit files
-    python3 validate.py results/<run> --tol 1e-12 -v
-    python3 validate.py results/<run> --baseline other.csv
+    python3 tools/validate.py results/20260731-172744_N100_200k   # run directory
+    python3 tools/validate.py data/cvrp_100.cvrpb solutions.txt    # explicit files
+    python3 tools/validate.py results/<run> --tol 1e-12 -v
+    python3 tools/validate.py results/<run> --baseline other.csv
 
 Given a run directory (produced by run.py), the instances are located on their
 own: `instances.cvrpb` if present, otherwise the `--bundle` source read from
@@ -37,7 +37,8 @@ import re
 import struct
 import sys
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.abspath(__file__))       # tools/
+ROOT = os.path.dirname(HERE)                            # repository root
 
 
 def read_bundle(path):
@@ -93,7 +94,17 @@ def read_solutions(path):
     return sols, rounded
 
 
-DEFAULT_BASELINE = os.path.join(HERE, "baseline", "baseline.csv")
+DEFAULT_BASELINE = os.path.join(ROOT, "baseline", "baseline.csv")
+
+
+def _short(path):
+    """Display a path relative to the repository root, not to the cwd.
+
+    Keeps the report readable when the script is invoked from elsewhere, where
+    os.path.relpath would otherwise produce a chain of `../`.
+    """
+    rel = os.path.relpath(os.path.abspath(path), ROOT)
+    return path if rel.startswith("..") else rel
 
 
 def resolve_run(path):
@@ -124,7 +135,7 @@ def resolve_run(path):
     if "--bundle" in cw_args:
         i = cw_args.index("--bundle")
         cand = cw_args[i + 1] if i + 1 < len(cw_args) else ""
-        for base in (os.getcwd(), HERE):
+        for base in (os.getcwd(), ROOT):
             p = cand if os.path.isabs(cand) else os.path.join(base, cand)
             if os.path.exists(p):
                 return p, sols, cfg
@@ -207,7 +218,7 @@ def main():
             )
         bundle, solutions, cfg = resolve_run(args.target)
         print(f"run {os.path.basename(os.path.normpath(args.target))}")
-        print(f"  instances : {os.path.relpath(bundle)}")
+        print(f"  instances : {_short(bundle)}")
     else:
         bundle, solutions = args.target, args.solutions
 
@@ -217,9 +228,12 @@ def main():
         print("  (integer distances, TSPLIB EUC_2D convention)")
 
     errors, worst = 0, 0.0
-    total_reported = 0.0
     total_recomputed = 0.0
     sizes = set()
+    # constraint tally, reported even when nothing fails
+    served = expected = duplicates = out_of_range = 0
+    routes_total = overloaded = 0
+    worst_ratio, worst_load = 0.0, (0.0, 0.0)
 
     for idx, name, n, cap, cost, routes in sols:
         if idx >= len(insts):
@@ -244,28 +258,36 @@ def main():
         for r, route in enumerate(routes):
             if not route:
                 continue
+            routes_total += 1
             load = 0.0
             prev = 0
             for c in route:
                 if not 1 <= c <= bn:
                     print(f"instance {idx}: customer {c} out of range", file=sys.stderr)
                     errors += 1
+                    out_of_range += 1
                     continue
                 if seen[c]:
                     print(f"instance {idx}: customer {c} served twice", file=sys.stderr)
                     errors += 1
+                    duplicates += 1
                 seen[c] = 1
                 total += d(prev, c)
                 load += ds[c]
                 prev = c
             total += d(prev, 0)
+            if bcap > 0 and load / bcap > worst_ratio:
+                worst_ratio, worst_load = load / bcap, (load, bcap)
             if load > bcap + 1e-9:
                 print(
                     f"instance {idx}: route {r} overloaded ({load} > {bcap})",
                     file=sys.stderr,
                 )
                 errors += 1
+                overloaded += 1
 
+        served += sum(seen[1:])
+        expected += bn
         missing_c = [c for c in range(1, bn + 1) if not seen[c]]
         if missing_c:
             print(
@@ -288,11 +310,14 @@ def main():
             print(
                 f"instance {idx} ({name}): {len(routes)} routes, cost {total:.6f}  OK"
             )
-        total_reported += cost
         total_recomputed += total
         sizes.add(bn)
 
     print(f"{len(sols)} instance(s) checked, {errors} error(s)")
+    report_constraints(
+        served, expected, duplicates, out_of_range,
+        routes_total, overloaded, worst_ratio, worst_load,
+    )
     print(f"  max relative gap reported / recomputed cost: {worst:.3e}")
     if sols:
         mean = total_recomputed / len(sols)
@@ -301,6 +326,35 @@ def main():
         report_gaps(mean, sizes, args.baseline)
         report_timing(cfg, len(sols))
     return 1 if errors else 0
+
+
+def report_constraints(
+    served, expected, duplicates, out_of_range,
+    routes_total, overloaded, worst_ratio, worst_load,
+):
+    """State the two CVRP constraints explicitly, pass or fail.
+
+    The per-instance checks only speak up on failure, which makes a clean run
+    indistinguishable from a run where nothing was checked. These two lines say
+    what was actually established.
+    """
+    cover = f"  coverage : {served}/{expected} customers served exactly once"
+    faults = []
+    if served != expected:
+        faults.append(f"{expected - served} missing")
+    if duplicates:
+        faults.append(f"{duplicates} duplicate(s)")
+    if out_of_range:
+        faults.append(f"{out_of_range} out of range")
+    print(cover + ("   [" + ", ".join(faults) + "]" if faults else "   OK"))
+
+    load, cap = worst_load
+    if cap > 0:
+        state = f"{overloaded} route(s) over" if overloaded else "OK"
+        print(
+            f"  capacity : {routes_total} route(s), fullest {load:g}/{cap:g} "
+            f"({100 * worst_ratio:.1f} % of Q)   {state}"
+        )
 
 
 def report_timing(cfg, n_inst):
