@@ -197,7 +197,22 @@ python3 tools/analyze.py --trace results/trace_<timestamp>   # -> analysis.png t
 Each trace lands in its own `results/trace_<timestamp>[_<name>]/`, the same
 convention `run.py` uses, so nothing is written to the repository root.
 
-`--trace` gives six panels a plain run cannot: the cost trajectory (current and
+Pass several trace directories to overlay them — the intended use is comparing
+starting solutions:
+
+```bash
+./cw_trace --bundle data/cvrp_100.cvrpb --index 0 --sa-steps 200000 --every 20 \
+           --init cw     --name cw
+./cw_trace --bundle data/cvrp_100.cvrpb --index 0 --sa-steps 200000 --every 20 \
+           --init random --name rnd
+python3 tools/analyze.py --trace results/trace_*_cw results/trace_*_rnd
+```
+
+which gives best-cost curves on a log scale, the same curves zoomed to the
+endgame, acceptance over time, and the per-operator net contribution of each
+start side by side.
+
+A single `--trace` gives six panels a plain run cannot: the cost trajectory (current and
 best-so-far), the measured temperature, the acceptance rate over time, accepted
 moves per operator, the net cost contribution of each operator, and the route
 count over time. Temperature deliberately occupies its own panel rather than

@@ -103,6 +103,9 @@ def load_run(path):
         pass
 
     num = lambda k: np.array([float(r[k]) for r in rows])
+    # the column was renamed cost_cw -> cost_init when --init landed; older
+    # results.csv files are still readable
+    init_col = "cost_init" if "cost_init" in rows[0] else "cost_cw"
     return {
         "path": path,
         "name": os.path.basename(os.path.normpath(path)),
@@ -110,7 +113,7 @@ def load_run(path):
         "n_inst": len(rows),
         "n": num("n"),
         "cap": num("capacity"),
-        "cw": num("cost_cw"),
+        "cw": num(init_col),
         "sa": num("cost_annealed"),
         "routes": num("routes"),
         "max_load": num("max_load"),
@@ -482,7 +485,7 @@ def figure_trace(target, out):
     fig, axes = plt.subplots(2, 3, figsize=(15, 8.2))
     inst = meta["instance"]
     fig.suptitle(f"SAVANT trace — {inst['name']}  (n={inst['n']}, "
-                 f"{meta['steps']:,} steps)", fontsize=13, color=INK,
+                 f"{meta['steps']:,} steps, {meta.get('init', 'cw')} start)", fontsize=13, color=INK,
                  x=0.012, ha="left", y=0.985)
 
     # 1. the cost trajectory — the whole point of tracing
@@ -491,8 +494,9 @@ def figure_trace(target, out):
         ax.plot(tr["step"], tr["cur"], color=SERIES[0], lw=0.7, alpha=0.55,
                 label="current")
         ax.plot(tr["step"], tr["best"], color=SERIES[1], lw=1.8, label="best")
-        ax.axhline(meta["cost_cw"], color=INK_2, lw=1.0, ls=":")
-        ax.annotate("Clarke & Wright", xy=(0, meta["cost_cw"]), xytext=(6, 4),
+        c0 = meta.get("cost_init", meta.get("cost_cw"))
+        ax.axhline(c0, color=INK_2, lw=1.0, ls=":")
+        ax.annotate(f"{meta.get('init', 'cw')} start", xy=(0, c0), xytext=(6, 4),
                     textcoords="offset points", color=INK_2, fontsize=8.5)
         ax.legend(loc="upper right")
     ax.set_title("Cost trajectory")
@@ -587,9 +591,10 @@ def stats_trace(target):
     meta, _ = load_trace(target)
     inst = meta["instance"]
     print(f"trace {inst['name']}  n={inst['n']}  Q={inst['capacity']:g}  "
-          f"seed {meta['seed']}")
-    print(f"  cost      : C&W {meta['cost_cw']:.6f} -> {meta['cost_final']:.6f}  "
-          f"({100 * (meta['cost_final'] - meta['cost_cw']) / meta['cost_cw']:+.2f} %)")
+          f"seed {meta['seed']}  init={meta.get('init', 'cw')}")
+    c0 = meta.get("cost_init", meta.get("cost_cw"))
+    print(f"  cost      : start {c0:.6f} -> {meta['cost_final']:.6f}  "
+          f"({100 * (meta['cost_final'] - c0) / c0:+.2f} %)")
     print(f"  schedule  : {meta['steps']:,} steps, T {meta['t0']:.5g} -> "
           f"{meta['tend']:.5g}")
     print(f"  drift     : {meta['drift']:.3e}")
@@ -606,26 +611,113 @@ def stats_trace(target):
     print()
 
 
+
+def figure_traces(targets, out):
+    """Overlay several traces — e.g. the same instance from different starts."""
+    loaded = [load_trace(t) for t in targets]
+    style()
+    fig, axes = plt.subplots(2, 2, figsize=(12.5, 8.4))
+    inst = loaded[0][0]["instance"]
+    fig.suptitle(f"SAVANT trace comparison — {inst['name']} (n={inst['n']})",
+                 fontsize=13, color=INK, x=0.012, ha="left", y=0.985)
+
+    def tag(meta):
+        return f"{meta.get('init', 'cw')} start"
+
+    # 1. best-so-far, log scale: the whole descent including a bad start
+    ax = axes[0][0]
+    for i, (meta, tr) in enumerate(loaded):
+        if tr is None:
+            continue
+        ax.plot(tr["step"], tr["best"], color=SERIES[i], lw=1.8, label=tag(meta))
+    ax.set_yscale("log")
+    ax.set_title("Best cost so far (log scale)")
+    ax.set_xlabel("step")
+    ax.set_ylabel("tour cost")
+    ax.legend(loc="upper right")
+    grid(ax)
+
+    # 2. the same, zoomed to where the runs actually finish
+    ax = axes[0][1]
+    finals = [m["cost_final"] for m, _ in loaded]
+    lo, hi = min(finals), max(finals)
+    pad = max(hi - lo, 0.05) * 6
+    for i, (meta, tr) in enumerate(loaded):
+        if tr is None:
+            continue
+        ax.plot(tr["step"], tr["best"], color=SERIES[i], lw=1.8, label=tag(meta))
+        ax.annotate(f"{meta['cost_final']:.4f}",
+                    xy=(tr["step"][-1], meta["cost_final"]), xytext=(-6, 6),
+                    textcoords="offset points", ha="right", color=INK,
+                    fontsize=8.5)
+    ax.set_ylim(lo - pad * 0.15, hi + pad)
+    ax.set_title("Endgame (same curves, zoomed)")
+    ax.set_xlabel("step")
+    ax.set_ylabel("tour cost")
+    grid(ax)
+
+    # 3. acceptance over time
+    ax = axes[1][0]
+    for i, (meta, tr) in enumerate(loaded):
+        if tr is None or len(tr["step"]) < 20:
+            continue
+        k = max(5, len(tr["accepted"]) // 60)
+        roll = np.convolve(tr["accepted"], np.ones(k) / k, mode="valid")
+        ax.plot(tr["step"][k - 1:], 100 * roll, color=SERIES[i], lw=1.5,
+                label=tag(meta))
+    ax.set_title("Acceptance rate over time")
+    ax.set_xlabel("step")
+    ax.set_ylabel("accepted (%)")
+    ax.legend(loc="upper right")
+    grid(ax)
+
+    # 4. who moved the cost, per start
+    ax = axes[1][1]
+    names = [o["name"] for o in loaded[0][0]["operators"] if o["draws"]]
+    y = np.arange(len(names))[::-1]
+    h = 0.8 / len(loaded)
+    for i, (meta, _) in enumerate(loaded):
+        vals = [o["sum_delta"] for o in meta["operators"] if o["draws"]]
+        ax.barh(y + (i - (len(loaded) - 1) / 2) * h, vals, height=h * 0.88,
+                color=SERIES[i], label=tag(meta))
+    ax.axvline(0, color=INK_2, lw=1.0)
+    ax.set_yticks(y, names)
+    ax.set_title("Net cost contribution  (negative = improvement)")
+    ax.set_xlabel("summed delta of accepted moves")
+    ax.legend(loc="lower left")
+    grid(ax, axis="x")
+
+    fig.tight_layout(rect=(0, 0, 1, 0.965))
+    fig.savefig(out, dpi=150)
+    plt.close(fig)
+    print(f"-> {out}")
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Statistics and plots for SAVANT runs",
         epilog="One run directory: full analysis. Several: comparison.",
     )
     ap.add_argument("runs", nargs="*", help="run directories (results/<id>/)")
-    ap.add_argument("--trace", metavar="DIR",
-                    help="a ./cw_trace output directory (results/trace_.../)")
+    ap.add_argument("--trace", metavar="DIR", nargs="+",
+                    help="one or more ./cw_trace output directories; several "
+                         "are overlaid for comparison")
     ap.add_argument("--out", help="output PNG "
                                   "(default: analysis.png inside the run)")
     ap.add_argument("--no-plot", action="store_true", help="statistics only")
     args = ap.parse_args()
 
     if args.trace:
-        stats_trace(args.trace)
+        for t in args.trace:
+            stats_trace(t)
         if not args.no_plot:
-            default = (os.path.join(args.trace, "analysis.png")
-                       if os.path.isdir(args.trace)
-                       else trace_base(args.trace) + ".png")
-            figure_trace(args.trace, args.out or default)
+            first = args.trace[0]
+            default = (os.path.join(first, "analysis.png")
+                       if os.path.isdir(first) else trace_base(first) + ".png")
+            if len(args.trace) == 1:
+                figure_trace(first, args.out or default)
+            else:
+                figure_traces(args.trace, args.out or "trace_comparison.png")
         if not args.runs:
             return 0
 

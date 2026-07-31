@@ -52,6 +52,42 @@ static void ensure_dir(const char *path)
         die("creating %s: %s", path, strerror(errno));
 }
 
+/* ------------------------------------------------------- random construction
+ * A *feasible* random start, not a uniformly random one: shuffle the customers
+ * and cut the sequence whenever the next one would overflow the vehicle. That
+ * keeps the comparison against Clarke & Wright about solution quality rather
+ * than about repairing infeasibility — which the annealer structurally cannot
+ * do anyway, since every operator rejects a capacity violation.
+ *
+ * First-fit on a random permutation also lands on a route count close to C&W's,
+ * so the two starts are comparable in structure and differ mainly in quality. */
+
+static double random_init(const Inst *in, WS *w, Sol *S, uint64_t seed)
+{
+    const int n = in->n;
+    int *perm = w->bufA;                       /* sized n+2 by ws_ensure */
+    for (int i = 0; i < n; i++) perm[i] = i + 1;
+
+    Rng r; rng_seed(&r, seed);
+    for (int i = n - 1; i > 0; i--) {          /* Fisher-Yates */
+        int j = rng_idx(&r, i + 1);
+        int t = perm[i]; perm[i] = perm[j]; perm[j] = t;
+    }
+
+    int nr = 0, start = 0;
+    double load = 0.0;
+    for (int i = 0; i < n; i++) {
+        if (i > start && load + in->dem[perm[i]] > in->cap + EPS) {
+            route_set(S, in, nr++, perm + start, i - start);
+            start = i; load = 0.0;
+        }
+        load += in->dem[perm[i]];
+    }
+    if (start < n) route_set(S, in, nr++, perm + start, n - start);
+    S->R = nr;
+    return sol_cost(in, S);
+}
+
 /* ------------------------------------------------- instrumented annealing
  * A copy of anneal() with three additions: the operator is drawn here rather
  * than inside sa_draw so we know which one ran; acceptance is read from the
@@ -163,6 +199,11 @@ static void trace_usage(void)
 "  --bundle FILE      .cvrpb bundle; --index K picks the instance (default 0)\n"
 "  --random           generate one instance (-n N --cap C --seed S)\n"
 "\n"
+"Initial solution:\n"
+"  --init cw|random   cw (default) = Clarke & Wright, as the solver does;\n"
+"                     random = shuffle the customers and cut into routes at\n"
+"                     the capacity limit. Isolates what the construction buys.\n"
+"\n"
 "Annealing (same meaning and defaults as cw):\n"
 "  --sa-steps N       default 100000\n"
 "  --sa-knn K         default 20\n"
@@ -200,7 +241,7 @@ int main(int argc, char **argv)
     o.w_rel = 1.0; o.w_swap = 1.0; o.w_2opt = 1.0; o.w_or = 0.0; o.or_max = 3;
 
     const char *out = NULL, *name = NULL;
-    int index = 0, want_csv = 1;
+    int index = 0, want_csv = 1, init_random = 0;
     long every = 1;
 
     for (int i = 1; i < argc; i++) {
@@ -228,6 +269,12 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--tend"))      o.sa_tend = atof(NEXT());
         else if (!strcmp(a, "--out"))       out = NEXT();
         else if (!strcmp(a, "--name"))      name = NEXT();
+        else if (!strcmp(a, "--init")) {
+            const char *v = NEXT();
+            if      (!strcmp(v, "cw"))     init_random = 0;
+            else if (!strcmp(v, "random")) init_random = 1;
+            else die("--init: cw | random");
+        }
         else if (!strcmp(a, "--every"))     every = atol(NEXT());
         else if (!strcmp(a, "--no-csv"))    want_csv = 0;
         else if (!strcmp(a, "--ops")) {
@@ -274,31 +321,51 @@ int main(int argc, char **argv)
     const uint64_t inst_seed = o.seed * 0x9E3779B97F4A7C15ULL + (uint64_t)index + 1;
     const uint64_t anneal_seed = inst_seed ^ 0x5DEECE66DULL;
 
-    /* ----------------------------- Clarke & Wright, via the real solve_cw */
+    /* ------------------------------------------------- initial solution */
     WS w; memset(&w, 0, sizeof w);
-    Opts build = o;
-    build.sa_steps = 0;                 /* construction only */
-    build.split = 0; build.split_every = 0;
     Result res; memset(&res, 0, sizeof res);
-    int *flat = NULL;
-    double t_cw0 = now_sec();
-    solve_cw(&inst, &w, &build, &res, &flat, inst_seed);
-    double t_cw = now_sec() - t_cw0;
-
-    /* rebuild a linked Sol from the flat [len, c.., 0, c.., 0] the solver emits */
     Sol S;
-    S.n = n; S.nxt = w.s_nxt; S.prv = w.s_prv; S.rid = w.s_rid; S.load = w.s_load;
-    int r = 0;
-    for (int t = 1; t <= flat[0]; ) {
-        int len = 0;
-        while (t + len <= flat[0] && flat[t + len] != 0) len++;
-        if (len) route_set(&S, &inst, r++, flat + t, len);
-        t += len + 1;
-    }
-    S.R = r;
-    free(flat);
+    double cost0, t_cw;
 
-    double cost0 = sol_cost(&inst, &S);
+    if (init_random) {
+        double dmax = 0.0;
+        for (int i = 1; i <= n; i++) if (inst.dem[i] > dmax) dmax = inst.dem[i];
+        if (dmax > inst.cap + EPS)
+            die("instance is infeasible (demand %g > capacity %g): "
+                "no feasible random start exists", dmax, inst.cap);
+        int K = o.sa_knn > 0 ? o.sa_knn : 1;
+        ws_ensure(&w, n, K, 1);
+        w.knn_k = 0;                    /* force the kNN lists to be built */
+        S.n = n; S.nxt = w.s_nxt; S.prv = w.s_prv;
+        S.rid = w.s_rid; S.load = w.s_load;
+        double t0c = now_sec();
+        cost0 = random_init(&inst, &w, &S, inst_seed ^ 0xA5A5A5A5A5A5A5A5ULL);
+        t_cw = now_sec() - t0c;
+        res.routes = S.R;
+    } else {
+        Opts build = o;
+        build.sa_steps = 0;             /* construction only */
+        build.split = 0; build.split_every = 0;
+        int *flat = NULL;
+        double t0c = now_sec();
+        solve_cw(&inst, &w, &build, &res, &flat, inst_seed);
+        t_cw = now_sec() - t0c;
+
+        /* rebuild a linked Sol from the flat [len, c.., 0, c.., 0] emitted */
+        S.n = n; S.nxt = w.s_nxt; S.prv = w.s_prv;
+        S.rid = w.s_rid; S.load = w.s_load;
+        int r = 0;
+        for (int t = 1; t <= flat[0]; ) {
+            int len = 0;
+            while (t + len <= flat[0] && flat[t + len] != 0) len++;
+            if (len) route_set(&S, &inst, r++, flat + t, len);
+            t += len + 1;
+        }
+        S.R = r;
+        free(flat);
+        cost0 = sol_cost(&inst, &S);
+    }
+    const int routes0 = S.R;
 
     /* --------------------------------------------------------- annealing */
     char outdir[4096], path[4200];
@@ -340,6 +407,7 @@ int main(int argc, char **argv)
     fprintf(jf, "  \"source\": \"%s\",\n", o.bundle ? o.bundle : "random");
     fprintf(jf, "  \"instance\": {\"index\": %d, \"name\": \"%s\", \"n\": %d, \"capacity\": %g},\n",
             index, inst.name, n, inst.cap);
+    fprintf(jf, "  \"init\": \"%s\",\n", init_random ? "random" : "cw");
     fprintf(jf, "  \"seed\": %llu,\n", (unsigned long long)o.seed);
     fprintf(jf, "  \"steps\": %d,\n", o.sa_steps);
     fprintf(jf, "  \"every\": %ld,\n", every);
@@ -350,7 +418,8 @@ int main(int argc, char **argv)
     fprintf(jf, "  \"t0\": %.10g,\n", t0_used);
     fprintf(jf, "  \"tend\": %.10g,\n",
             o.sa_t0 > 0 ? o.sa_tend : t0_used * pow(10.0, -o.sa_decades));
-    fprintf(jf, "  \"cost_cw\": %.10f,\n", cost0);
+    fprintf(jf, "  \"cost_init\": %.10f,\n", cost0);
+    fprintf(jf, "  \"routes_init\": %d,\n", routes0);
     fprintf(jf, "  \"cost_final\": %.10f,\n", final);
     fprintf(jf, "  \"cost_tracked\": %.10f,\n", tracked);
     fprintf(jf, "  \"drift\": %.3e,\n", fabs(final - tracked));
@@ -374,7 +443,9 @@ int main(int argc, char **argv)
 
     /* ------------------------------------------------------------- stdout */
     printf("instance %d (%s): n=%d Q=%g\n", index, inst.name, n, inst.cap);
-    printf("C&W cost      : %.6f  (%d routes, %.3f ms)\n", cost0, res.routes, t_cw * 1e3);
+    printf("%-14s: %.6f  (%d routes, %.3f ms)\n",
+           init_random ? "random start" : "C&W cost",
+           cost0, routes0, t_cw * 1e3);
     printf("after %d steps: %.6f   (%+.2f %%, %.1f ms)\n", o.sa_steps, final,
            100.0 * (final - cost0) / cost0, t_sa * 1e3);
     printf("T0 %.5g -> Tend %.5g   drift %.2e\n", t0_used,

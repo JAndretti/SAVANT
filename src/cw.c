@@ -150,6 +150,7 @@ static inline uint32_t rng_bounded(Rng *r, uint32_t bound)   /* [0,bound) */
 typedef struct {
     const char *dir, *bundle, *csv, *sol, *dump, *validate;
     int   random, n, m, threads, knn, do2opt, rounded, limit, quiet, per_inst;
+    int   init_random;      /* --init random : skip the savings build */
     uint64_t seed;
     double cap, lambda, mu;
     /* simulated annealing */
@@ -1487,6 +1488,7 @@ static double solve_cw(const Inst *in, WS *w, const Opts *o,
     if (K < 1) K = 1;
 
     size_t nsav = exact ? ((size_t)n * (size_t)(n - 1)) / 2 : (size_t)n * (size_t)K;
+    if (o->init_random) nsav = 1;         /* no savings list is ever built */
     ws_ensure(w, n, K, nsav ? nsav : 1);
 
     double *d0 = w->d0;
@@ -1514,81 +1516,117 @@ static double solve_cw(const Inst *in, WS *w, const Opts *o,
     double lam = o->lambda, mu = o->mu;
     if (rnd & 2) { lam *= 0.75 + 0.5 * rng_unit(&rcw); mu += 0.3 * rng_unit(&rcw); }
 
-    /* --- savings generation --- */
-    Sav *S = w->sav;
-    size_t m = 0;
-
-    if (exact) {
-        for (int i = 1; i <= n; i++) {
-            double d0i = d0[i];
-            for (int j = i + 1; j <= n; j++) {
-                double s = d0i + d0[j] - lam * dist(in, i, j) + mu * fabs(d0i - d0[j]);
-                if (alpha > 0.0) s *= 1.0 + alpha * (2.0 * rng_unit(&rcw) - 1.0);
-                if (s <= 0.0) continue;
-                float sf = (float)s; uint32_t k;
-                memcpy(&k, &sf, 4);
-                S[m].key = k; S[m].ij = ((uint32_t)i << 16) | (uint32_t)j; m++;
-            }
-        }
-    } else {
-        knn_need(in, w, K);
-        for (int i = 1; i <= n; i++) {
-            const int *nb = w->nbr + (size_t)(i - 1) * K;
-            double d0i = d0[i];
-            for (int t = 0; t < K; t++) {
-                int j = nb[t];
-                if (j <= 0 || j == i) continue;
-                int a = i, b = j;
-                if (a > b) { a = j; b = i; }     /* duplicates possible: harmless */
-                double s = d0i + d0[j] - lam * dist(in, i, j) + mu * fabs(d0i - d0[j]);
-                if (alpha > 0.0) s *= 1.0 + alpha * (2.0 * rng_unit(&rcw) - 1.0);
-                if (s <= 0.0) continue;
-                float sf = (float)s; uint32_t k;
-                memcpy(&k, &sf, 4);
-                S[m].key = k; S[m].ij = ((uint32_t)a << 16) | (uint32_t)b; m++;
-            }
-        }
-    }
-
-    radix_sort(S, w->tmp, m);
-
-    /* --- route merging (decreasing savings) --- */
-    int *uf = w->uf, *deg = w->deg, *adj = w->adj;
-    double *load = w->load;
-    for (int i = 1; i <= n; i++) { uf[i] = i; deg[i] = 0; load[i] = in->dem[i]; }
     const double cap = in->cap;
-
-    for (size_t t = m; t-- > 0; ) {
-        uint32_t ij = S[t].ij;
-        int i = (int)(ij >> 16), j = (int)(ij & 0xFFFF);
-        if (deg[i] >= 2 || deg[j] >= 2) continue;    /* a route endpoint? */
-        int ri = uf_find(uf, i), rj = uf_find(uf, j);
-        if (ri == rj) continue;                      /* already same route   */
-        if (load[ri] + load[rj] > cap + EPS) continue;
-        adj[2 * i + deg[i]++] = j;
-        adj[2 * j + deg[j]++] = i;
-        uf[rj] = ri; load[ri] += load[rj];
-    }
-
-    /* --- rebuilding the routes --- */
     int *flat = w->flat, *rstart = w->rstart, *rt = w->route;
     int *seen = w->seen;
     int R = 0, nf = 0, visited = 0;
     for (int i = 1; i <= n; i++) seen[i] = 0;
 
-    for (int s = 1; s <= n; s++) {
-        if (seen[s] || deg[s] >= 2) continue;        /* start from an endpoint */
-        int L = 0, prev = 0, cur = s;
-        while (cur) {
-            rt[++L] = cur; seen[cur] = 1; visited++;
-            int nx = 0;
-            for (int e = 0; e < deg[cur]; e++)
-                if (adj[2 * cur + e] != prev) { nx = adj[2 * cur + e]; break; }
-            prev = cur; cur = nx;
+    if (o->init_random) {
+    /* ---------------------------------------------- random feasible start
+     * Shuffle the customers and cut the sequence whenever the next one would
+     * overflow the vehicle. Feasible by construction, which matters: the
+     * annealing operators reject any capacity violation, so an infeasible
+     * start could never be repaired. First-fit on a random permutation also
+     * lands close to the savings construction's route count, so the two
+     * starts differ in quality rather than in shape.
+     *
+     * Every restart draws its own permutation from rcw, so --restarts gives a
+     * genuine multi-start. --cw-rand, --cw-alpha, --lambda, --mu and the
+     * savings list size have no effect on this path. */
+    int *perm = w->bufA;
+    for (int i = 0; i < n; i++) perm[i] = i + 1;
+    for (int i = n - 1; i > 0; i--) {                /* Fisher-Yates */
+        int j = rng_idx(&rcw, i + 1);
+        int t = perm[i]; perm[i] = perm[j]; perm[j] = t;
+    }
+    int start = 0;
+    double load = 0.0;
+    for (int i = 0; i <= n; i++) {
+        int flush = (i == n) ||
+                    (i > start && load + in->dem[perm[i]] > cap + EPS);
+        if (flush && i > start) {
+            int L = i - start;
+            for (int t = 0; t < L; t++) rt[t + 1] = perm[start + t];
+            if (o->do2opt && L >= 3) { rt[0] = 0; two_opt(in, rt, L); }
+            rstart[R++] = nf;
+            for (int t = 1; t <= L; t++) { flat[nf++] = rt[t]; seen[rt[t]] = 1; }
+            visited += L;
+            start = i; load = 0.0;
         }
-        if (o->do2opt && L >= 3) { rt[0] = 0; two_opt(in, rt, L); }
-        rstart[R++] = nf;
-        for (int t = 1; t <= L; t++) flat[nf++] = rt[t];
+        if (i < n) load += in->dem[perm[i]];
+    }
+
+    } else {
+        /* --- savings generation --- */
+        Sav *S = w->sav;
+        size_t m = 0;
+
+        if (exact) {
+            for (int i = 1; i <= n; i++) {
+                double d0i = d0[i];
+                for (int j = i + 1; j <= n; j++) {
+                    double s = d0i + d0[j] - lam * dist(in, i, j) + mu * fabs(d0i - d0[j]);
+                    if (alpha > 0.0) s *= 1.0 + alpha * (2.0 * rng_unit(&rcw) - 1.0);
+                    if (s <= 0.0) continue;
+                    float sf = (float)s; uint32_t k;
+                    memcpy(&k, &sf, 4);
+                    S[m].key = k; S[m].ij = ((uint32_t)i << 16) | (uint32_t)j; m++;
+                }
+            }
+        } else {
+            knn_need(in, w, K);
+            for (int i = 1; i <= n; i++) {
+                const int *nb = w->nbr + (size_t)(i - 1) * K;
+                double d0i = d0[i];
+                for (int t = 0; t < K; t++) {
+                    int j = nb[t];
+                    if (j <= 0 || j == i) continue;
+                    int a = i, b = j;
+                    if (a > b) { a = j; b = i; }     /* duplicates possible: harmless */
+                    double s = d0i + d0[j] - lam * dist(in, i, j) + mu * fabs(d0i - d0[j]);
+                    if (alpha > 0.0) s *= 1.0 + alpha * (2.0 * rng_unit(&rcw) - 1.0);
+                    if (s <= 0.0) continue;
+                    float sf = (float)s; uint32_t k;
+                    memcpy(&k, &sf, 4);
+                    S[m].key = k; S[m].ij = ((uint32_t)a << 16) | (uint32_t)b; m++;
+                }
+            }
+        }
+
+        radix_sort(S, w->tmp, m);
+
+        /* --- route merging (decreasing savings) --- */
+        int *uf = w->uf, *deg = w->deg, *adj = w->adj;
+        double *load = w->load;
+        for (int i = 1; i <= n; i++) { uf[i] = i; deg[i] = 0; load[i] = in->dem[i]; }
+
+        for (size_t t = m; t-- > 0; ) {
+            uint32_t ij = S[t].ij;
+            int i = (int)(ij >> 16), j = (int)(ij & 0xFFFF);
+            if (deg[i] >= 2 || deg[j] >= 2) continue;    /* a route endpoint? */
+            int ri = uf_find(uf, i), rj = uf_find(uf, j);
+            if (ri == rj) continue;                      /* already same route   */
+            if (load[ri] + load[rj] > cap + EPS) continue;
+            adj[2 * i + deg[i]++] = j;
+            adj[2 * j + deg[j]++] = i;
+            uf[rj] = ri; load[ri] += load[rj];
+        }
+
+        for (int s = 1; s <= n; s++) {
+            if (seen[s] || deg[s] >= 2) continue;        /* start from an endpoint */
+            int L = 0, prev = 0, cur = s;
+            while (cur) {
+                rt[++L] = cur; seen[cur] = 1; visited++;
+                int nx = 0;
+                for (int e = 0; e < deg[cur]; e++)
+                    if (adj[2 * cur + e] != prev) { nx = adj[2 * cur + e]; break; }
+                prev = cur; cur = nx;
+            }
+            if (o->do2opt && L >= 3) { rt[0] = 0; two_opt(in, rt, L); }
+            rstart[R++] = nf;
+            for (int t = 1; t <= L; t++) flat[nf++] = rt[t];
+        }
     }
     rstart[R] = nf;
 
@@ -1803,6 +1841,13 @@ static void usage(void)
 "  --cap C            capacity (default: 30/40/50/70 for n=20/50/100/200)\n"
 "  --seed S           random seed                  (default 42)\n"
 "\n"
+"Initial solution:\n"
+"  --init cw|random   cw (default) = Clarke & Wright savings construction;\n"
+"                     random = shuffle the customers and cut into routes at\n"
+"                     the capacity limit. With --restarts each restart draws\n"
+"                     its own permutation. The savings options below have no\n"
+"                     effect on the random path.\n"
+"\n"
 "Heuristic options:\n"
 "  --knn K            savings limited to the K nearest neighbours\n"
 "                     0 = automatic (exact if n<=1500), default 0\n"
@@ -1908,6 +1953,12 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--lambda"))       o.lambda = atof(NEXT());
         else if (!strcmp(a, "--mu"))           o.mu = atof(NEXT());
         else if (!strcmp(a, "--2opt"))         o.do2opt = 1;
+        else if (!strcmp(a, "--init")) {
+            const char *v = NEXT();
+            if      (!strcmp(v, "cw"))     o.init_random = 0;
+            else if (!strcmp(v, "random")) o.init_random = 1;
+            else die("--init: cw | random");
+        }
         else if (!strcmp(a, "--round"))        o.rounded = 1;
         else if (!strcmp(a, "--sa-steps"))     o.sa_steps = atoi(NEXT());
         else if (!strcmp(a, "--no-sa"))        o.sa_steps = 0;
@@ -2037,10 +2088,15 @@ int main(int argc, char **argv)
         else if (o.bundle) printf("# source     : %s (%d instances, loaded in %.2f s)\n", o.bundle, M, t_load);
         else               printf("# source     : random n=%d, m=%d, Q=%g, seed=%llu\n",
                                   o.n, M, o.cap, (unsigned long long)o.seed);
-        printf("# savings    : %s", o.knn < 0 ? "exact" : (o.knn == 0 ? "auto" : "knn"));
-        if (o.knn > 0) printf(" K=%d", o.knn);
-        if (o.lambda != 1.0 || o.mu != 0.0) printf(", lambda=%g, mu=%g", o.lambda, o.mu);
-        printf("%s\n", o.do2opt ? ", + intra-route 2-opt" : "");
+        if (o.init_random) {
+            printf("# init       : random (shuffle + first fit)%s\n",
+                   o.do2opt ? ", + intra-route 2-opt" : "");
+        } else {
+            printf("# savings    : %s", o.knn < 0 ? "exact" : (o.knn == 0 ? "auto" : "knn"));
+            if (o.knn > 0) printf(" K=%d", o.knn);
+            if (o.lambda != 1.0 || o.mu != 0.0) printf(", lambda=%g, mu=%g", o.lambda, o.mu);
+            printf("%s\n", o.do2opt ? ", + intra-route 2-opt" : "");
+        }
         if (o.sa_steps > 0) {
             double wt = o.w_rel + o.w_swap + o.w_2opt + o.w_or;
             if (o.sa_t0 > 0)
@@ -2073,8 +2129,9 @@ int main(int argc, char **argv)
             static const char *cn[4] = { "none", "savings perturbation",
                                          "Yellow parameters", "both" };
             printf("# restarts   : %d per instance, randomisation: %s",
-                   o.restarts, cn[o.cw_rand]);
-            if (o.cw_rand & 1) printf(" (alpha=%g)", o.cw_alpha);
+                   o.restarts, o.init_random ? "a fresh permutation"
+                                             : cn[o.cw_rand]);
+            if (!o.init_random && (o.cw_rand & 1)) printf(" (alpha=%g)", o.cw_alpha);
             printf("\n");
         }
         printf("# threads    : %d\n", nthreads);
@@ -2155,14 +2212,14 @@ int main(int argc, char **argv)
 
     if (o.per_inst) {
         for (int k = 0; k < M; k++)
-            printf("%5d %-30s C&W=%11.5f  annealed=%11.5f  routes=%3d  %s  %.3f ms\n",
+            printf("%5d %-30s init=%11.5f  annealed=%11.5f  routes=%3d  %s  %.3f ms\n",
                    k, o.random ? "(random)" : insts[k].name, R[k].cost0, R[k].cost, R[k].routes,
                    R[k].feasible ? "ok " : "NO ", R[k].time_ms);
     }
     if (o.csv) {
         FILE *f = fopen(o.csv, "w");
         if (!f) die("ecriture de %s : %s", o.csv, strerror(errno));
-        fprintf(f, "instance,n,capacity,cost_cw,cost_annealed,routes,max_load,feasible,time_ms\n");
+        fprintf(f, "instance,n,capacity,cost_init,cost_annealed,routes,max_load,feasible,time_ms\n");
         for (int k = 0; k < M; k++)
             fprintf(f, "%s,%d,%g,%.10f,%.10f,%d,%g,%d,%.4f\n",
                     o.random ? "random" : insts[k].name,

@@ -2,7 +2,7 @@
 
 | file | lines | role |
 |---|---:|---|
-| `cw.c` | 2209 | the entire solver, one translation unit |
+| `cw.c` | 2266 | the entire solver, one translation unit |
 | `trace.c` | ~340 | instrumented single-instance driver; **does not modify `cw.c`** |
 
 Built from the repository root:
@@ -26,20 +26,20 @@ loop depends on it.
 | 1–43 | header comment, includes | OpenMP shim so the file builds without `-fopenmp` |
 | 44–73 | utils | `die`, `xmalloc`, `xrealloc`, `now_sec` |
 | 74–147 | RNG | splitmix64 seeding, xoshiro256\*\*, plus `rng32` / `rng_idx` / `rng_bit`, the reduced-randomness path |
-| 148–164 | `Opts` | every command-line option in one struct |
-| 165–219 | `Inst`, random generation | index 0 = depot; Kool/NeuOpt distribution |
-| 220–388 | readers | `.cvrpb` bundle, TSPLIB `.vrp`, directory scan |
-| 389–520 | `WS` workspace | per-thread buffers, allocated once and reused |
-| 521–559 | union-find, LSD radix sort | stable sort on the float32 saving key |
-| 560–705 | k nearest neighbours | uniform grid scanned in rings, brute force below n = 512 |
-| 706–731 | intra-route 2-opt | the `--2opt` construction post-process |
-| 732–976 | annealing scaffolding | `Sol`, virtual depots, `sa_accept`, `lb_build`, Fenwick tree, `inc[]`, `pick_u` |
-| 977–1209 | the four operators | `mv_relocate`, `mv_swap`, `mv_oropt`, `mv_2opt` |
-| 1210–1355 | optimal Split | Prins recurrence with Vidal's O(n) monotone deque |
-| 1356–1459 | annealing driver | `sa_draw`, `calibrate_T0`, `anneal` |
-| 1460–1678 | `solve_cw` | the per-instance pipeline: savings → merge → anneal → Split, over restarts |
-| 1679–1784 | output and validation | `.cvrpb` export, built-in `--validate` |
-| 1785–2209 | `usage()` and `main` | CLI parsing, OpenMP loop, statistics, CSV / solution writing |
+| 148–165 | `Opts` | every command-line option in one struct |
+| 166–220 | `Inst`, random generation | index 0 = depot; Kool/NeuOpt distribution |
+| 221–389 | readers | `.cvrpb` bundle, TSPLIB `.vrp`, directory scan |
+| 390–521 | `WS` workspace | per-thread buffers, allocated once and reused |
+| 522–560 | union-find, LSD radix sort | stable sort on the float32 saving key |
+| 561–706 | k nearest neighbours | uniform grid scanned in rings, brute force below n = 512 |
+| 707–732 | intra-route 2-opt | the `--2opt` construction post-process |
+| 733–977 | annealing scaffolding | `Sol`, virtual depots, `sa_accept`, `lb_build`, Fenwick tree, `inc[]`, `pick_u` |
+| 978–1210 | the four operators | `mv_relocate`, `mv_swap`, `mv_oropt`, `mv_2opt` |
+| 1211–1356 | optimal Split | Prins recurrence with Vidal's O(n) monotone deque |
+| 1357–1460 | annealing driver | `sa_draw`, `calibrate_T0`, `anneal` |
+| 1461–1716 | `solve_cw` | the per-instance pipeline; the construction branches on `--init` at line 1526 |
+| 1717–1822 | output and validation | `.cvrpb` export, built-in `--validate` |
+| 1823–2266 | `usage()` and `main` | CLI parsing, OpenMP loop, statistics, CSV / solution writing |
 
 ## Things worth knowing before editing
 
@@ -54,6 +54,12 @@ comparison in the acceptance test, diverging the whole trajectory. Use
 
 **`MAXN` is 65535** because savings pack `i` and `j` into 16 bits each inside an
 8-byte record (`Sav`). Raising the limit means widening that record.
+
+**`--init random` skips the savings path entirely** (src/cw.c:1526): no savings
+list is built, no sort, no merge. `--knn`, `--exact`, `--lambda`, `--mu`,
+`--cw-rand` and `--cw-alpha` therefore have no effect on that path, and the
+savings buffer is not even allocated. Each restart draws its own permutation, so
+`--restarts` still gives a genuine multi-start.
 
 **The radix sort is only correct for positive keys.** Savings are filtered to
 `> 0` before insertion, which is what makes the IEEE-754 bit patterns of the
@@ -84,6 +90,15 @@ analysis.png   added by tools/analyze.py --trace
 ```
 
 Scope by construction: one instance, one run, no multi-restart.
+
+**`--init cw|random`** selects the starting solution. `random` shuffles the
+customers and cuts the sequence whenever the next one would overflow the
+vehicle — a *feasible* random start, not a uniformly random one, so the
+comparison is about solution quality rather than about repairing infeasibility
+(which the annealer cannot do: every operator rejects a capacity violation).
+First-fit on a random permutation also lands near C&W's route count, so the two
+starts are structurally comparable. This is the ablation that isolates what the
+construction actually buys.
 
 **How it avoids duplicating the solver.** `trace.c` does
 `#define main cw_main_unused` and then `#include "cw.c"`. Because every function
