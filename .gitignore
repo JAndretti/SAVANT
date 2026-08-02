@@ -12,15 +12,19 @@ wheels/
 # Local tooling and scratch notes
 .claude/
 cmd.txt
+# reference implementation received by mail, kept locally only
+code yann /
 
 # Run outputs (run.py writes one directory per run)
 res/
 results/
 
-# Compiled solver
+# Compiled solver (regenerate with make / make debug / make trace)
 cw
 cw_dbg
+cw_trace
 *.o
+*.dSYM/
 
 # Downloaded / generated instances — regenerate with:
 #   python3 fetch_neuopt.py      -> data/
