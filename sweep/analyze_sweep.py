@@ -91,16 +91,20 @@ FLAGS = {"--no-sa", "--exact", "--2opt", "--round", "--random",
          "--per-instance", "-q", "--check"}
 DEFAULTS = {
     "n": 100, "m": 1000, "seed": 42, "sa-steps": 1000, "init": "cw",
-    "ops": "1,1,1,0", "or-max": 3, "sa-knn": 20, "restarts": 1,
+    "ops": "1,1,1,0,0,0", "or-max": 3, "sa-knn": 20, "restarts": 1,
     "split": "off", "split-every": 0, "split-tour": "both",
     "pick": 2, "pick-crit": "lb", "pick-eps": 0.3,
     "t-accept": 0.001, "t-decades": 2, "lambda": 1.0, "mu": 0.0,
     "knn": 0, "threads": 0, "cw-rand": "perturb", "cw-alpha": 0.03,
     "no-sa": False, "exact": False, "2opt": False,
+    # added with swap*, route opening, the selection biases and racing
+    "vrank": 1, "pick2": 1, "reloc-side": "coin", "pair": 0,
+    "race": 0.0, "race-at": 0.25,
 }
 NUMERIC = {"n", "m", "seed", "sa-steps", "or-max", "sa-knn", "restarts",
-           "split-every", "pick", "t-decades", "knn", "threads"}
-FLOAT = {"pick-eps", "t-accept", "lambda", "mu", "cw-alpha"}
+           "split-every", "pick", "t-decades", "knn", "threads",
+           "vrank", "pick2", "pair"}
+FLOAT = {"pick-eps", "t-accept", "lambda", "mu", "cw-alpha", "race-at"}
 
 LOG_PATTERNS = (
     ("cost_before", r"mean cost before annealing\s*:\s*([\d.]+)"),
@@ -116,6 +120,19 @@ LOG_PATTERNS = (
     ("throughput", r"throughput\s*:\s*([\d.]+)"),
     ("infeasible", r"instances\s*:\s*\d+\s*\((\d+) infeasible\)"),
 )
+
+
+def norm_ops(s: str) -> str:
+    """--ops padded to the canonical six weights.
+
+    cw accepts 4 (or fewer) values and zero-fills the rest, so `1,1,1,0` and
+    `1,1,1,0,0,0` are the same run. Normalising here keeps runs recorded before
+    swap* existed comparable with runs recorded after, and lets DEFAULTS hold a
+    single spelling.
+    """
+    parts = [p for p in re.split(r"[,:/]", str(s).strip()) if p != ""]
+    parts = (parts + ["0"] * 6)[:6]
+    return ",".join("%g" % float(p) for p in parts)
 
 
 def parse_cmd(cmd: str) -> dict:
@@ -140,6 +157,10 @@ def parse_cmd(cmd: str) -> dict:
             val = int(val)
         elif key in FLOAT:
             val = float(val)
+        elif key == "race":                 # a margin, or the word "off"
+            val = 0.0 if val == "off" else float(val)
+        elif key == "ops":
+            val = norm_ops(val)
         o[key] = val
         i += 2
     if o.get("no-sa"):
@@ -170,6 +191,18 @@ class Run:
         return f"<Run {self.study}/{self.tag} mean={self.mean:.5f}>"
 
 
+def ffloat(s, default=float("nan")):
+    """float() that also accepts a comma decimal separator.
+
+    run_sweep.sh pins LC_ALL=C, but .meta files written before it did can carry
+    a locale-formatted wall time such as "0,055".
+    """
+    try:
+        return float(str(s).replace(",", "."))
+    except (TypeError, ValueError):
+        return default
+
+
 def read_run(base, study, tag_default):
     meta = {}
     with open(base + ".meta", encoding="utf-8") as f:
@@ -198,7 +231,7 @@ def read_run(base, study, tag_default):
     if ok and arrays[0].size == 0:
         ok = False
     return Run(study, meta.get("tag", tag_default), opts, ok,
-               float(meta.get("wall_s", "nan")), log, arrays)
+               ffloat(meta.get("wall_s", "nan")), log, arrays)
 
 
 def load(results_dir: str) -> list[Run]:
@@ -430,13 +463,21 @@ def equiv_budget(target, steps, costs):
     return None
 
 
-OPNAMES = ("rel", "swap", "2opt", "or")
+OPNAMES = ("rel", "swap", "2opt", "or", "swap*", "open")
 
 
 def ops_label(ops: str) -> str:
-    bits = [int(float(x) > 0) for x in ops.split(",")]
+    bits = [int(float(x) > 0) for x in norm_ops(ops).split(",")]
     on = [OPNAMES[i] for i, b in enumerate(bits) if b]
     return "+".join(on) if on else "none"
+
+
+def wall_of(r) -> float:
+    """Seconds of wall clock for a run: cw's own figure, else the shell's."""
+    v = r.log.get("wall_s")
+    if v is None or not np.isfinite(v):
+        v = r.shell_s
+    return float(v)
 
 
 # =========================================================== the studies
@@ -586,6 +627,10 @@ move first picks a vertex $u$ (Section~\ref{sec:pick}) and a partner $v$ near it
 \end{itemize}
 Every move is accepted by the Metropolis rule on its exact cost delta. The
 default is \texttt{1,1,1,0}: or-opt is present in the code but switched off.
+\texttt{-{}-ops} takes two further weights, for swap* and route opening, which
+are also zero by default and have a section of their own
+(Section~\ref{sec:newops}); this section is about the original four, so every
+run in it leaves the other two at zero.
 """)
     doc.p(r"""
 \textbf{The question.} Is the default subset the right one, is the uniform
@@ -653,6 +698,197 @@ relocate (a length-1 relocate is the same move) while being more expensive per
 draw, so at a fixed step count it buys less. \texttt{-{}-or-max} is then
 irrelevant --- its whole range sits inside the noise. Leaving or-opt off is the
 right default.
+""")
+
+
+def study_newops(runs, out, doc):
+    rs = sel(runs, "newops")
+    if not rs:
+        return
+    # The x1 rung of the ladder is by construction the same run as the weight
+    # blocks below (same n, same budget, stock operators), which is what makes
+    # it a valid baseline for them. Guard it rather than assume it.
+    base = next((r for r in rs if r.tag == "bud_def_x1"), None)
+    others = [r for r in rs if r.tag.startswith(("sstar_", "open_", "mix_"))]
+    if base and others and any(r.opts["sa-steps"] != base.opts["sa-steps"]
+                               for r in others):
+        print("  !! newops: ladder and weight blocks disagree on --sa-steps",
+              file=sys.stderr)
+        base = None
+    if base is None:
+        return
+
+    doc.sec("swap* and route opening", "sec:newops")
+    doc.p(r"""
+\textbf{What it controls.} \texttt{-{}-ops} carries two further weights beyond
+the four of Section~\ref{sec:ops}, both defaulting to zero:
+\begin{itemize}\itemsep2pt
+  \item \textbf{swap*} (\texttt{mv\_swapstar}, \texttt{cw.c:1216}) --- Vidal's
+        \emph{Hybrid genetic search for the CVRP}, C\&OR 2022. Ordinary swap
+        forces $u$ into $v$'s slot; swap* drops that and re-inserts each of the
+        two customers at its \emph{best} position in the other's route. The two
+        routes are disjoint, so the two re-insertions are independent and the
+        delta is still exact --- but the scan costs $O(L_1+L_2)$ instead of
+        $O(1)$. The kNN neighbour selects the target \emph{route}, not the
+        partner: $v$ is then the worse by regret of two uniform customers of
+        that route.
+  \item \textbf{opening} (\texttt{mv\_open}, \texttt{cw.c:1325}) --- isolate one
+        customer in an empty route. Almost always worsening, and that is the
+        point: the annealing can empty a route but has no move that repopulates
+        one, so the number of active routes is a one-way door between two
+        Splits. This is the only move that opens it again.
+\end{itemize}
+""")
+    doc.p(r"""
+\textbf{The question.} swap* is the one non-elementary operator in the solver,
+so it has to earn its cost: at a fixed step count it is not competing on equal
+terms. Everything below is therefore also measured against wall time.
+""")
+
+    fig = plt.figure(figsize=(12, 8.5))
+    gs = fig.add_gridspec(2, 2, height_ratios=[1, 1.15])
+
+    # --- weight of each new operator, one at a time
+    ax = fig.add_subplot(gs[0, 0])
+    ss = sorted([r for r in rs if r.tag.startswith("sstar_")],
+                key=lambda r: float(r.opts["ops"].split(",")[4]))
+    op = sorted([r for r in rs if r.tag.startswith("open_")],
+                key=lambda r: float(r.opts["ops"].split(",")[5]))
+    for lab, group, idx, col in (("swap* weight", ss, 4, CAT[0]),
+                                 ("opening weight", op, 5, CAT[1])):
+        if not group:
+            continue
+        st = [paired(base, r) for r in group]
+        x = [float(r.opts["ops"].split(",")[idx]) for r in group]
+        ax.plot(x, [s["pct"] for s in st], "o-", color=col, label=lab)
+        ax.fill_between(x, [s["pct_lo"] for s in st], [s["pct_hi"] for s in st],
+                        color=col, alpha=0.15, linewidth=0)
+    ax.axhline(0, color=INK3, lw=1.0)
+    ax.set_xscale("log")
+    ax.set_xlabel("weight (relative to 1 for relocate / swap / 2-opt)")
+    ax.set_ylabel("Δ vs default (%)")
+    ax.set_title("One new operator at a time, equal steps", loc="left")
+    ax.legend()
+    style(ax)
+
+    # --- the mixtures
+    ax = fig.add_subplot(gs[0, 1])
+    mix = sorted([r for r in rs if r.tag.startswith("mix_")], key=lambda r: r.mean)
+    if mix:
+        bar_delta(ax, [ops_label(r.opts["ops"]) for r in mix],
+                  [paired(base, r) for r in mix],
+                  "Operator mixtures, equal steps")
+
+    # --- the honest one: cost against measured wall time
+    ax = fig.add_subplot(gs[1, :])
+    LADDER = (("def", "default 1,1,1,0", CAT[2]),
+              ("sstar", "+ swap*", CAT[0]),
+              ("sstaropen", "+ swap* + opening", CAT[1]),
+              ("dropswap", "swap* instead of swap", CAT[3]))
+    iso_rows, curves = [], {}
+    for key, lab, col in LADDER:
+        g = sorted([r for r in rs if r.tag.startswith(f"bud_{key}_x")],
+                   key=lambda r: r.opts["sa-steps"])
+        if not g:
+            continue
+        t = [wall_of(r) for r in g]
+        c = [r.mean for r in g]
+        curves[key] = (g, t, c)
+        ax.plot(t, c, "o-", color=col, label=lab)
+    ax.set_xscale("log")
+    ax.set_xlabel("wall time for %s instances (s, log)"
+                  % f"{base.opts['m']:,}" if base else "wall time (s, log)")
+    ax.set_ylabel("mean cost")
+    ax.set_title("Cost against wall time — the comparison that counts", loc="left")
+    ax.legend()
+    style(ax)
+    fig.tight_layout()
+    savefig(fig, out, "newops.png")
+    doc.fig("newops.png",
+            "Top left: each new operator's weight swept alone. Top right: "
+            "mixtures. Bottom: cost against measured wall time for four "
+            "configurations swept over a 32x budget range --- a curve that sits "
+            "lower-left dominates.")
+
+    doc.table(["mixture", "mean cost", *DHEAD],
+              [[ops_label(r.opts["ops"]), "%.5f" % r.mean,
+                *stat_cells(paired(base, r))] for r in mix],
+              "Operator mixtures at equal step count, paired against the stock "
+              "\\texttt{-{}-ops 1,1,1,0,0,0}. Equal steps flatters swap*, which "
+              "is why the wall-time reading below is the one to trust.",
+              align="lrrrr")
+
+    # iso-time: for each budget of the default, what does each config cost at
+    # the same wall time?
+    if "def" in curves and len(curves) > 1:
+        gd, td, cd = curves["def"]
+        for key, lab, _ in LADDER[1:]:
+            if key not in curves:
+                continue
+            g, t, c = curves[key]
+            row = [esc(lab)]
+            for target_t in (td[len(td) // 2], td[-1]):
+                ci = float(np.interp(math.log(target_t),
+                                     np.log(t), c)) if min(t) <= target_t <= max(t) else float("nan")
+                cdef = float(np.interp(math.log(target_t), np.log(td), cd))
+                row.append("%.2fs" % target_t)
+                row.append("%.5f" % cdef if np.isfinite(cdef) else "--")
+                row.append("%.5f" % ci if np.isfinite(ci) else "out of range")
+                row.append("%+.3f\\,\\%%" % (100 * (ci - cdef) / cdef)
+                           if np.isfinite(ci) else "--")
+            iso_rows.append(row)
+    if iso_rows:
+        doc.table(["configuration", "time", "default", "this", r"$\Delta$",
+                   "time", "default", "this", r"$\Delta$"], iso_rows,
+                  "Iso-time reading of the bottom panel: both curves "
+                  "interpolated in $\\log$(wall time) at two points of the "
+                  "default's own ladder. Negative $\\Delta$ = better at the "
+                  "same wall time.", align="lrrrrrrrr")
+
+    # --- across dimension
+    ns = sorted({r.opts["n"] for r in rs if r.tag.endswith(("_off", "_on"))})
+    rows = []
+    for n in ns:
+        a = next((r for r in rs if r.tag == f"n{n}_off"), None)
+        b = next((r for r in rs if r.tag == f"n{n}_on"), None)
+        s = paired(a, b)
+        if s:
+            rows.append([n, "%.5f" % a.mean, "%.5f" % b.mean, *stat_cells(s),
+                         "%.2f" % (wall_of(b) / max(wall_of(a), 1e-9))])
+    if rows:
+        doc.table([r"$n$", "default", "+swap*+open", *DHEAD, "time x"], rows,
+                  "\\texttt{-{}-ops 1,1,1,0,1,0.05} against the default across "
+                  "dimension, at equal step count. The last column is the wall "
+                  "time ratio --- the price of the equal-step gain.",
+                  align="rrrrrrr")
+    doc.p(r"""
+\textbf{Reading.} swap* is the largest single improvement in this whole
+document, and --- unlike most of the others --- it survives the change of
+yardstick. It costs about 20\,\% more wall time per step, but the iso-time table
+shows it still ahead by roughly half a percent at both ends of the ladder, so
+the extra work per draw is bought back several times over. Its weight is
+insensitive over the whole range tried: anything from a quarter to four times
+the weight of relocate lands within noise of the same place, which is what one
+wants from a knob.
+""")
+    doc.p(r"""
+Route opening is a different kind of thing. On its own it is worth almost
+nothing, and at large weight it is actively harmful --- unsurprising, since it
+never improves a solution by itself. It is a pure enabler: the annealing can
+empty a route but has no other move that repopulates one, so without it the
+route count is monotone between two Splits. Kept at a small weight it is close
+to free and slightly positive.
+""")
+    doc.p(r"""
+The one result here that contradicts the intuition behind the code is that
+\emph{dropping} swap in favour of swap* is not a trade-off at all: it is the
+best configuration on the ladder at both time points. For any given pair, the
+in-place exchange is one of the positions swap* already sweeps, so
+$\Delta_{\text{swap*}} \le \Delta_{\text{swap}}$ always; the measurement says
+that the ten-fold cheaper draw of ordinary swap does not buy back that
+domination. swap is nevertheless kept in the code as a separate operator --- it
+is a weighting decision, and \texttt{-{}-ops 1,1,1,0,1,0.05} remains the safer
+recommendation at small $n$, where the two are within noise of each other.
 """)
 
 
@@ -1203,6 +1439,304 @@ reports a rule the code is not using.
 """)
 
 
+def study_select(runs, out, doc):
+    rs = sel(runs, "select")
+    if not rs:
+        return
+    base = next((r for r in rs if r.tag == "vrank1_K20"), None) \
+        or next((r for r in rs if r.tag == "side_coin"), None)
+
+    doc.sec("Biasing the second vertex", "sec:select")
+    doc.p(r"""
+\textbf{What it controls.} Section~\ref{sec:pick} is about choosing the vertex
+$u$ to move. These three knobs are about the \emph{partner} $v$, and about where
+$u$ is put once chosen.
+\begin{itemize}\itemsep2pt
+  \item \texttt{-{}-vrank T} --- the kNN lists are stored sorted by distance, so
+        drawing the index as the \emph{minimum of $T$ uniform draws} biases
+        towards the nearer neighbours at no memory access at all. $T=1$ is the
+        plain uniform draw.
+  \item \texttt{-{}-pick2 T} --- a tournament of size $T$ among candidate
+        partners, keeping the one of largest regret. Unlike \texttt{-{}-vrank}
+        this one costs a memory read per candidate.
+  \item \texttt{-{}-reloc-side long} --- relocate breaks the \emph{longer} of
+        the two edges adjacent to $v$ instead of flipping a coin, which
+        maximises the $-d(v,q)$ term of the insertion cost. Two reads, no
+        randomness.
+\end{itemize}
+""")
+    doc.p(r"""
+\textbf{The question.} \texttt{-{}-vrank} is claimed to be \emph{coupled} with
+\texttt{-{}-sa-knn}: a longer candidate list gives the reach, the rank bias
+restores the concentration, and either one alone is supposed to hurt. That is
+only testable on the grid, so the grid is what is run.
+""")
+
+    fig = plt.figure(figsize=(12, 8))
+    gs = fig.add_gridspec(2, 2, height_ratios=[1.15, 1])
+
+    # --- vrank x sa-knn heat map, the coupling claim
+    ax = fig.add_subplot(gs[0, 0])
+    vs = sorted({r.opts["vrank"] for r in rs if r.tag.startswith("vrank")})
+    Ks = sorted({r.opts["sa-knn"] for r in rs if r.tag.startswith("vrank")})
+    mat = np.full((len(vs), len(Ks)), np.nan)
+    for i, v in enumerate(vs):
+        for j, K in enumerate(Ks):
+            r = next((x for x in rs if x.tag == f"vrank{v}_K{K}"), None)
+            s = paired(base, r)
+            if s:
+                mat[i, j] = s["pct"]
+    heat(ax, mat, [f"vrank {v}" for v in vs], [f"K={K}" for K in Ks],
+         "--vrank x --sa-knn (Δ % vs vrank 1, K=20)", "Δ %")
+
+    # --- pick2
+    ax = fig.add_subplot(gs[0, 1])
+    p2 = sorted([r for r in rs if r.tag.startswith("pick2_")],
+                key=lambda r: r.opts["pick2"])
+    if p2:
+        st = [paired(base, r) for r in p2]
+        x = [r.opts["pick2"] for r in p2]
+        ax.plot(x, [s["pct"] for s in st], "o-", color=CAT[0])
+        ax.fill_between(x, [s["pct_lo"] for s in st], [s["pct_hi"] for s in st],
+                        color=CAT[0], alpha=0.15, linewidth=0)
+        ax.axhline(0, color=INK3, lw=1.0)
+        ax.set_xlabel("--pick2 (tournament size on v)")
+        ax.set_ylabel("Δ vs --pick2 1 (%)")
+        ax.set_title("Tournament on the partner", loc="left")
+        style(ax)
+
+    # --- reloc-side, alone and with swap* on
+    ax = fig.add_subplot(gs[1, 0])
+    side_rows = []
+    pairs = [("side_coin", "side_long", "default operators"),
+             ("side_coin_sstar", "side_long_sstar", "with swap* active")]
+    labs, sts = [], []
+    for a_tag, b_tag, lab in pairs:
+        a = next((r for r in rs if r.tag == a_tag), None)
+        b = next((r for r in rs if r.tag == b_tag), None)
+        s = paired(a, b)
+        if s:
+            labs.append(lab)
+            sts.append(s)
+            side_rows.append([esc(lab), "%.5f" % a.mean, "%.5f" % b.mean,
+                              *stat_cells(s)])
+    if sts:
+        bar_delta(ax, labs, sts, "--reloc-side long vs coin")
+
+    # --- across dimension
+    ax = fig.add_subplot(gs[1, 1])
+    dim_rows, dlabs, dsts = [], [], []
+    for n in sorted({r.opts["n"] for r in rs if r.tag.endswith(("_plain", "_vrank2"))}):
+        a = next((r for r in rs if r.tag == f"n{n}_plain"), None)
+        b = next((r for r in rs if r.tag == f"n{n}_vrank2"), None)
+        s = paired(a, b)
+        if s:
+            dlabs.append(f"n={n}")
+            dsts.append(s)
+            dim_rows.append([n, "%.5f" % a.mean, "%.5f" % b.mean, *stat_cells(s)])
+    if dsts:
+        bar_delta(ax, dlabs, dsts, "--vrank 2 --sa-knn 30 vs default, by n")
+    fig.tight_layout()
+    savefig(fig, out, "select.png")
+    doc.fig("select.png",
+            "Top left: the \\texttt{-{}-vrank}/\\texttt{-{}-sa-knn} grid, the "
+            "coupling claim. Top right: tournament size on the partner. Bottom "
+            "left: the relocate insertion side. Bottom right: the recommended "
+            "\\texttt{-{}-vrank 2 -{}-sa-knn 30} pair across dimension.")
+
+    rows = []
+    for i, v in enumerate(vs):
+        for j, K in enumerate(Ks):
+            r = next((x for x in rs if x.tag == f"vrank{v}_K{K}"), None)
+            if r:
+                rows.append([v, K, "%.5f" % r.mean, *stat_cells(paired(base, r))])
+    doc.table([r"\texttt{-{}-vrank}", r"\texttt{-{}-sa-knn}", "mean cost", *DHEAD],
+              rows, "The full \\texttt{-{}-vrank} $\\times$ "
+              "\\texttt{-{}-sa-knn} grid, paired against \\texttt{vrank 1, "
+              "K=20} (the default).", align="rrrrrr", long=True)
+    if side_rows:
+        doc.table(["context", "coin", "long", *DHEAD], side_rows,
+                  "The relocate insertion side, with and without swap* active.",
+                  align="lrrrrr")
+    if dim_rows:
+        doc.table([r"$n$", "default", "vrank 2, K=30", *DHEAD], dim_rows,
+                  "The rank bias with the longer candidate list, across "
+                  "dimension.", align="rrrrrr")
+    doc.p(r"""
+\textbf{Reading.} The coupling claim does not reproduce here, and the heat map
+is unusually unambiguous about it: the best cell of the whole grid is the
+default corner, every increase in \texttt{-{}-vrank} makes things worse at every
+$K$, and the effect compounds --- the supposed winning combination, a longer
+list with a stronger rank bias, is among the worst cells tried. The most likely
+explanation is that the claim was made against a construction that shares one
+$K=30$ neighbour list between the savings and the annealing, whereas here the
+savings are exact for $n \le 1500$ and the annealing builds its own list. Those
+are not the same baseline, and this sweep cannot settle which is right for the
+other one --- only that on this code, at this budget, the rank bias costs.
+""")
+    doc.p(r"""
+\texttt{-{}-pick2} is the mild surprise: a tournament of 3 on the partner is a
+small but genuine improvement, which makes it the only selection bias in this
+document that survives while costing a memory read per candidate. It is worth
+about a tenth of what swap* is worth, and the curve is flat enough between 2 and
+4 that the exact size does not matter. The relocate insertion side moves in the
+right direction with and without swap* active, but neither interval excludes
+zero: on this evidence it is free rather than useful, and it is left off.
+""")
+
+
+def study_race(runs, out, doc):
+    rs = sel(runs, "race")
+    if not rs:
+        return
+    base = next((r for r in rs if r.tag == "margin_off"), None)
+
+    doc.sec("Racing between restarts, and interleaving", "sec:race")
+    doc.p(r"""
+\textbf{What it controls.} Section~\ref{sec:restarts} spends the budget equally
+over the restarts. \texttt{-{}-race M} spends it unequally instead: at
+\texttt{-{}-race-at} of its own budget (a quarter by default) a start is
+compared with the best \emph{finished} start \emph{at the same point of its
+trajectory} --- same temperature, which is what makes the comparison fair --- and
+abandoned if it is worse by a relative margin $M$. Its unspent steps lengthen the
+schedules of the starts that follow, and whatever is left at the end is spent
+polishing the best solution found. The total step budget never changes; only its
+allocation does.
+""")
+    doc.p(r"""
+\texttt{-{}-pair} is a different kind of knob: two starts are advanced
+alternately in the same loop so that one's memory latency overlaps with the
+other's arithmetic. Each chain owns its solution, its incremental buffers and its
+random stream, so without \texttt{-{}-race} the trajectories are identical bit
+for bit and only the clock may move. That makes it a self-checking row in the
+table below: if the cost column is not flat, something is wrong.
+""")
+    doc.p(r"""
+\textbf{The question.} Every run in this section holds
+$\texttt{restarts} \times \texttt{sa-steps}$ constant, because a racing gain at
+unequal budget would be meaningless.
+""")
+
+    fig = plt.figure(figsize=(12, 8))
+    gs = fig.add_gridspec(2, 2)
+
+    ax = fig.add_subplot(gs[0, 0])
+    mg = [r for r in rs if r.tag.startswith("margin_")]
+    mg = sorted(mg, key=lambda r: r.opts["race"])
+    if mg:
+        bar_delta(ax, ["off" if r.opts["race"] == 0 else "%g" % r.opts["race"]
+                       for r in mg], [paired(base, r) for r in mg],
+                  "Racing margin (10 starts, equal total budget)")
+
+    ax = fig.add_subplot(gs[0, 1])
+    at = sorted([r for r in rs if r.tag.startswith("at_")],
+                key=lambda r: r.opts["race-at"])
+    if at:
+        st = [paired(base, r) for r in at]
+        x = [r.opts["race-at"] for r in at]
+        ax.plot(x, [s["pct"] for s in st], "o-", color=CAT[1])
+        ax.fill_between(x, [s["pct_lo"] for s in st], [s["pct_hi"] for s in st],
+                        color=CAT[1], alpha=0.15, linewidth=0)
+        ax.axhline(0, color=INK3, lw=1.0)
+        ax.set_xlabel("--race-at (fraction of the budget at the checkpoint)")
+        ax.set_ylabel("Δ vs no racing (%)")
+        ax.set_title("Where to put the checkpoint", loc="left")
+        style(ax)
+
+    ax = fig.add_subplot(gs[1, 0])
+    Rs = sorted({r.opts["restarts"] for r in rs if r.tag.startswith("R")})
+    rrows, rlabs, rsts = [], [], []
+    for R in Rs:
+        a = next((r for r in rs if r.tag == f"R{R}_off"), None)
+        b = next((r for r in rs if r.tag == f"R{R}_on"), None)
+        s = paired(a, b)
+        if s:
+            rlabs.append(f"{R} starts")
+            rsts.append(s)
+            rrows.append([R, "%.5f" % a.mean, "%.5f" % b.mean, *stat_cells(s)])
+    if rsts:
+        bar_delta(ax, rlabs, rsts, "Racing vs equal split, by restart count")
+
+    ax = fig.add_subplot(gs[1, 1])
+    prows, pn, pspd = [], [], []
+    for n in sorted({r.opts["n"] for r in rs if r.tag.startswith("pair")}):
+        a = next((r for r in rs if r.tag == f"pair0_n{n}"), None)
+        b = next((r for r in rs if r.tag == f"pair1_n{n}"), None)
+        if not (a and b):
+            continue
+        spd = wall_of(a) / max(wall_of(b), 1e-9)
+        same = "yes" if abs(a.mean - b.mean) < 1e-9 else "NO"
+        pn.append(n)
+        pspd.append(spd)
+        prows.append([n, "%.5f" % a.mean, "%.5f" % b.mean, same,
+                      "%.2fs" % wall_of(a), "%.2fs" % wall_of(b), "%.2fx" % spd])
+    if pn:
+        ax.plot(pn, pspd, "o-", color=CAT[0])
+        ax.axhline(1.0, color=INK3, lw=1.0)
+        ax.set_xscale("log")
+        ax.set_xlabel("n (log)")
+        ax.set_ylabel("speed-up of --pair 1 over --pair 0")
+        ax.set_title("Interleaving two chains per core", loc="left")
+        style(ax)
+    fig.tight_layout()
+    savefig(fig, out, "race.png")
+    doc.fig("race.png",
+            "Top: the racing margin and the checkpoint position, both at equal "
+            "total budget. Bottom left: racing against an equal split as the "
+            "number of starts grows. Bottom right: the interleaving speed-up, "
+            "which is a timing result only --- the costs are identical.")
+
+    doc.table(["margin", "mean cost", *DHEAD],
+              [["off" if r.opts["race"] == 0 else "%g" % r.opts["race"],
+                "%.5f" % r.mean, *stat_cells(paired(base, r))] for r in mg],
+              "Racing margin, 10 starts at equal total budget.", align="rrrrr")
+    if at:
+        doc.table([r"\texttt{-{}-race-at}", "mean cost", *DHEAD],
+                  [["%g" % r.opts["race-at"], "%.5f" % r.mean,
+                    *stat_cells(paired(base, r))] for r in at],
+                  "Position of the checkpoint, at margin 0.002.", align="rrrrr")
+    if rrows:
+        doc.table(["starts", "equal split", "racing", *DHEAD], rrows,
+                  "Racing against an equal split, holding "
+                  "$\\texttt{restarts} \\times \\texttt{sa-steps}$ constant.",
+                  align="rrrrrr")
+    if prows:
+        doc.table([r"$n$", r"\texttt{-{}-pair 0}", r"\texttt{-{}-pair 1}",
+                   "identical", "wall 0", "wall 1", "speed-up"], prows,
+                  "Interleaving. The \\emph{identical} column is the check that "
+                  "this is an engineering change and not an algorithmic one: "
+                  "the two costs must agree exactly.", align="rrrlrrr")
+    doc.p(r"""
+\textbf{Reading.} Racing needs starts to race: with two it has almost nothing to
+redistribute, and the gain grows steadily with the restart count. It is the
+second largest effect in this document after swap*, and it costs nothing --- the
+budget is the same, only its allocation changes.
+""")
+    doc.p(r"""
+The margin behaves monotonically over the range tried, which is worth noting
+because it was not the expectation: the tightest margin is the best one, and
+loosening it only ever gives ground back. By $0.05$ almost no start is ever
+behind by that much at the checkpoint, so the setting is indistinguishable from
+\texttt{off}, and by $0.2$ it is exactly \texttt{off}. There was reason to expect
+the other failure mode as well --- a margin so tight that good starts are killed
+on noise --- and this sweep does not reach it, so the bottom of the useful range
+is still unmeasured. The checkpoint position matters much less than the margin;
+anything from a tenth to half of the budget is within noise of the default
+quarter, and only pushing it out to three quarters clearly hurts, by which point
+most of the budget the racing was meant to reclaim has already been spent.
+""")
+    doc.p(r"""
+\texttt{-{}-pair} does exactly what it claims. The \emph{identical} column reads
+\texttt{yes} on every row --- the interleaved chains reproduce the sequential
+trajectories exactly --- and the speed-up appears only once the state of one
+chain stops fitting in the low-level caches: slightly negative at $n \le 500$,
+where the bookkeeping is not paid back, and clearly positive from $n = 1000$.
+That is a smaller effect than the $1.42\times$ reported for the implementation
+this was ported from; the shape of the curve is the same, so the difference is
+most likely the cache hierarchy of the machine rather than the technique.
+""")
+
+
 def study_temp(runs, out, doc):
     rs = sel(runs, "temp")
     if not rs:
@@ -1446,6 +1980,11 @@ KNOB_KEYS = {
     "restarts (equal budget)": ["restarts"],
     "savings shape": ["lambda", "mu"],
     "initialisation": ["init"],
+    "new operators": ["ops"],
+    "partner bias": ["vrank", "sa-knn"],
+    "partner tournament": ["pick2"],
+    "relocate side": ["reloc-side"],
+    "racing": ["race", "race-at"],
 }
 
 
@@ -1485,6 +2024,25 @@ def knobs(runs):
                                 and r.opts["sa-steps"] == 100000), None),
         [r for r in sel(runs, "init")
          if r.opts["n"] == 100 and r.opts["sa-steps"] == 100000])
+
+    # --- knobs added with swap*, the selection biases and racing ---
+    # Baseline for the newops study is its own ladder rung at the default
+    # budget, so the comparison is against the same step count.
+    nb = next((r for r in sel(runs, "newops") if r.tag == "bud_def_x1"), None)
+    add("new operators", nb,
+        [r for r in sel(runs, "newops")
+         if r.tag.startswith(("sstar_", "open_", "mix_"))])
+    sb = next((r for r in sel(runs, "select") if r.tag == "vrank1_K20"), None)
+    add("partner bias", sb,
+        [r for r in sel(runs, "select") if r.tag.startswith("vrank")])
+    add("partner tournament", next((r for r in sel(runs, "select")
+                                    if r.tag == "pick2_1"), None) or sb,
+        [r for r in sel(runs, "select") if r.tag.startswith("pick2_")])
+    add("relocate side", next((r for r in sel(runs, "select")
+                               if r.tag == "side_coin"), None),
+        [r for r in sel(runs, "select") if r.tag in ("side_coin", "side_long")])
+    add("racing", next((r for r in sel(runs, "race") if r.tag == "margin_off"), None),
+        [r for r in sel(runs, "race") if r.tag.startswith(("margin_", "at_"))])
     return out
 
 
@@ -1540,24 +2098,58 @@ def flags_for(run, keys):
 
 
 def best_config(runs, ks):
-    """Flags from every knob whose winner beat its own default significantly."""
-    flags, kept, dropped = [], [], []
+    """Flags from every knob whose winner beat its own default significantly.
+
+    Several knobs share cw options -- "operators" and "new operators" both write
+    --ops, "neighbourhood" and "partner bias" both write --sa-knn. Two knobs
+    cannot set the same option to different values, so a collision is resolved
+    in favour of the larger improvement and the loser is reported as dropped.
+    """
+    winners, dropped = [], []
     for label, ref, best, s in ks:
         keys = KNOB_KEYS.get(label, [])
-        if s["sig"] and s["pct"] < 0 and keys:
-            f = flags_for(best, keys)
-            if f:
-                flags += f
-                kept.append((label, best, s, f))
-                continue
-        dropped.append((label, best, s))
+        f = flags_for(best, keys) if keys else []
+        if s["sig"] and s["pct"] < 0 and f:
+            winners.append((label, best, s, f, keys))
+        else:
+            dropped.append((label, best, s, "no significant improvement"))
+
+    winners.sort(key=lambda w: w[2]["pct"])          # strongest first
+    claimed, kept, flags = {}, [], []
+    for label, best, s, f, keys in winners:
+        touched = [k for k in keys if ("--" + k) in f]
+        clash = [k for k in touched if k in claimed]
+        if clash:
+            dropped.append((label, best, s, "same option as %s, which won by "
+                            "more" % claimed[clash[0]]))
+            continue
+        for k in touched:
+            claimed[k] = label
+        flags += f
+        kept.append((label, best, s, f))
+
+    def drop(label, why):
+        """Remove a knob after the fact, rebuilding flags from what is left."""
+        nonlocal flags, kept
+        row = next((k for k in kept if k[0] == label), None)
+        if not row:
+            return
+        kept = [k for k in kept if k[0] != label]
+        flags = [f for _, _, _, fl in kept for f in fl]
+        dropped.append((row[0], row[1], row[2], why))
+
     # --or-max is inert unless or-opt carries a positive weight
     if "--or-max" in flags:
         ops = flags[flags.index("--ops") + 1] if "--ops" in flags else DEFAULTS["ops"]
-        if float(ops.split(",")[3]) <= 0:
-            i = flags.index("--or-max")
-            del flags[i:i + 2]
-            kept = [k for k in kept if k[0] != "or-opt length"]
+        if float(norm_ops(ops).split(",")[3]) <= 0:
+            drop("or-opt length", "inert: or-opt has weight 0 here")
+    # racing has nothing to redistribute with a single start
+    if "--race" in flags:
+        rst = flags[flags.index("--restarts") + 1] if "--restarts" in flags \
+            else DEFAULTS["restarts"]
+        if int(rst) < 2:
+            drop("racing", "inert: needs --restarts > 1, which did not win "
+                           "its own knob")
     return flags, kept, dropped
 
 
@@ -1570,9 +2162,112 @@ CMD_GROUPS = (
     ("annealing budget and moves", ["sa-steps", "ops", "or-max"]),
     ("temperature schedule", ["t-accept", "t-decades"]),
     ("move sampling", ["sa-knn", "pick", "pick-crit", "pick-eps"]),
+    ("partner and insertion side", ["vrank", "pick2", "reloc-side"]),
     ("restarts", ["restarts", "cw-rand", "cw-alpha"]),
+    ("budget allocation", ["race", "race-at", "pair"]),
     ("Split", ["split", "split-every", "split-tour"]),
 )
+
+
+# Per-option commentary, emitted only for the options the sweep actually
+# changed. Keeping these keyed by option name rather than written as one block
+# is what stops the text describing a previous run's winners.
+OPTION_NOTES = {
+    "t-decades": r"""
+\textbf{\texttt{-{}-t-decades}} (default 2) --- the width of the temperature
+schedule. The annealing does not take $T_0$ as an argument:
+\texttt{calibrate\_T0} samples worsening moves on the instance itself and solves
+for the $T_0$ at which a fraction \texttt{-{}-t-accept} of them would be accepted
+($0.1\,\%$ by default). From there the temperature decays geometrically to
+$T_{\text{end}} = T_0 \cdot 10^{-D}$, one factor
+$\alpha = 10^{-D/(\text{steps}-1)}$ per step, with $D =$
+\texttt{-{}-t-decades}. So $D$ is \emph{how many orders of magnitude the
+temperature falls over the run}: $D=2$ ends a hundred times colder than it
+started, $D=1$ only ten times colder. Lowering $D$ keeps the search warm for
+longer; the reading is that the default schedule freezes early and spends its
+last steps at temperatures where essentially nothing is accepted. It is
+budget-dependent by construction.
+""",
+    "lambda": r"""
+\textbf{\texttt{-{}-lambda} and \texttt{-{}-mu}} (defaults 1 and 0) --- the shape
+of the Clarke \& Wright savings criterion,
+\[
+  s(i,j) \;=\; d_{0i} + d_{0j} \;-\; \lambda\, d_{ij}
+                \;+\; \mu\,\lvert d_{0i} - d_{0j}\rvert .
+\]
+At $\lambda=1$, $\mu=0$ this is the original 1964 criterion. The construction
+merges route endpoints in decreasing $s$ while capacity allows, so $s$ decides
+nothing but the \emph{order} in which pairs are considered --- which is enough to
+determine the whole solution. $\lambda$ reweights the direct link against the two
+depot legs: above 1 the criterion is more sceptical of long links, so only
+genuinely close pairs merge early and the routes come out more compact and less
+radial. $\mu$ rewards merging customers at \emph{different} distances from the
+depot, favouring routes that run outward and sweep back. The two interact and
+neither is much good alone --- and the optimum is a fact about this instance
+family, uniform points on a square, not a universal constant.
+""",
+    "ops": r"""
+\textbf{\texttt{-{}-ops}} --- the operator mixture (Sections~\ref{sec:ops}
+and~\ref{sec:newops}). Positions 5 and 6 are swap* and route opening, both zero
+by default. swap* is the only non-elementary move in the solver, $O(L_1+L_2)$
+per draw against $O(1)$ for everything else, so it is the one option here whose
+equal-step gain and equal-time gain genuinely differ; see the wall-time panel of
+Section~\ref{sec:newops} for the comparison that counts.
+""",
+    "reloc-side": r"""
+\textbf{\texttt{-{}-reloc-side long}} (default \texttt{coin}) --- which of the
+two edges adjacent to the partner $v$ relocate breaks when inserting $u$.
+\texttt{coin} flips a bit; \texttt{long} breaks the longer of the two, which
+maximises the $-d(v,q)$ term of the insertion cost. Two array reads and no
+randomness, and the diversity of insertion positions is still carried by the
+draw of $v$ among the nearest neighbours --- which is why it can afford to be
+deterministic where the analogous choices on the $u$ side cannot.
+""",
+    "vrank": r"""
+\textbf{\texttt{-{}-vrank}} (default 1) --- a bias towards the nearer candidate
+partners, obtained by drawing the index into the kNN list as the minimum of $T$
+uniform draws. The lists are already sorted by distance, so this costs no memory
+access at all. It is meant to be used with a larger \texttt{-{}-sa-knn}: the
+longer list supplies the reach, the rank bias restores the concentration.
+""",
+    "pick2": r"""
+\textbf{\texttt{-{}-pick2}} (default 1) --- a tournament of size $T$ among
+candidate partners, keeping the one of largest regret. Unlike
+\texttt{-{}-vrank} this costs a memory read per candidate.
+""",
+    "race": r"""
+\textbf{\texttt{-{}-race}} (default off) --- budget redistribution between
+restarts (Section~\ref{sec:race}). At \texttt{-{}-race-at} of its budget a start
+is compared with the best finished start \emph{at the same point of its
+trajectory}, and abandoned if it is behind by more than the margin. The unspent
+steps go to the starts that follow, and the remainder polishes the best solution
+found. The total budget is unchanged; only its allocation is. It does nothing
+with a single start.
+""",
+    "restarts": r"""
+\textbf{\texttt{-{}-restarts}} --- how many independent Clarke \& Wright
+constructions are annealed, the best kept (Section~\ref{sec:restarts}). Here the
+comparison is always at equal \emph{total} budget, so more restarts means
+proportionally fewer steps each.
+""",
+    "split": r"""
+\textbf{\texttt{-{}-split}} --- optimal re-cutting of the giant tour
+(Section~\ref{sec:split}). It can never make a solution worse, so the only
+question it raises is whether the time it takes is better spent annealing.
+""",
+    "sa-knn": r"""
+\textbf{\texttt{-{}-sa-knn}} --- how many nearest neighbours a move may draw its
+partner from (Section~\ref{sec:knn}). Too small and the search cannot reach;
+too large and most draws propose a partner far enough away that the move is
+rejected on arrival.
+""",
+    "pick-crit": r"""
+\textbf{\texttt{-{}-pick-crit}} --- the definition of the ``regret'' that
+drives which vertex gets moved (Section~\ref{sec:pick}).
+""",
+}
+OPTION_NOTES["mu"] = OPTION_NOTES["lambda"]     # explained together
+OPTION_NOTES["race-at"] = OPTION_NOTES["race"]
 
 
 def resolve(flags, steps):
@@ -1643,12 +2338,51 @@ whose interval straddles zero has not earned a change.
               "Knobs that earned their place, with the improvement each showed "
               "on its own.", align="llrrrl")
     if dropped:
-        doc.table(["knob", "best setting tried", *DHEAD],
-                  [[esc(l), tt(b.tag), *stat_cells(s)] for l, b, s in dropped],
-                  "Knobs left at their default: no significant improvement.",
-                  align="llrrr")
+        doc.table(["knob", "best setting tried", *DHEAD, "why not"],
+                  [[esc(l), tt(b.tag), *stat_cells(s), esc(why)]
+                   for l, b, s, why in dropped],
+                  "Knobs left at their default, and why. Note the distinction: "
+                  "most of these simply showed no significant improvement, but "
+                  "a knob can also be dropped while being significant on its "
+                  "own, if it is inert in the company it would keep.",
+                  align="llrrrl")
+
+    # The one-knob-at-a-time frame cannot express "A is only worth having if B
+    # is too". Racing is exactly that, and it is a large effect, so it gets
+    # said in words with the numbers that support it.
+    r8 = one(runs, "tuned", "n100_r8")
+    rr8 = one(runs, "tuned", "n100_newall_r8")
+    nall = one(runs, "tuned", "n100_newall")
+    dflt = one(runs, "tuned", "n100_default")
+    if all((r8, rr8, nall, dflt)):
+        s_pair = paired(dflt, rr8)
+        s_solo = paired(dflt, nall)
+        doc.p(r"""
+\textbf{One caveat the table above cannot express.} Racing was worth
+%s on its own --- the second largest effect in this document --- and it is still
+dropped, because it does nothing without more than one start, and
+\texttt{-{}-restarts} did not clear the bar on its own knob. The two only pay
+together: at $n=100$ and equal total budget, the recommended options with a
+single start reach %.5f (%s vs the default), and the same options with 8 starts
+and racing reach %.5f (%s). If you are going to spend the budget on restarts at
+all, turn racing on; the sweep's one-knob-at-a-time frame simply has no way to
+say so.
+""" % (("%+.3f\\,\\%%" % next(s["pct"] for l, b, s, _ in dropped
+                              if l == "racing")) if any(
+            l == "racing" for l, _, _, _ in dropped) else "its measured amount",
+       nall.mean, "%+.3f\\,\\%%" % s_solo["pct"] if s_solo else "--",
+       rr8.mean, "%+.3f\\,\\%%" % s_pair["pct"] if s_pair else "--"))
 
     vals = resolve(flags, steps)
+    # --restarts multiplies the work, so the recommendation has to spend the
+    # same TOTAL budget as the default it is compared with -- that is the only
+    # sense in which the knob was measured (the `iso_` block of
+    # Section~\ref{sec:restarts}). Without this the confirmation below would
+    # hand the tuned command R times the steps and call the result an
+    # improvement.
+    nrestarts = int(vals.get("restarts", 1) or 1)
+    tuned_steps = max(1, steps // nrestarts)
+    vals["sa-steps"] = tuned_steps
     changed = [k for _, keys in CMD_GROUPS for k in keys
                if k != "sa-steps" and vals[k] != DEFAULTS[k]]
 
@@ -1673,65 +2407,21 @@ Written out in full, defaults included, so the run does not depend on what
              andlist("%s was %s" % (tt("--" + k), tt(fmtv(DEFAULTS[k])))
                      for k in changed)))
 
-    doc.sub("What the three changed options do")
-    doc.p(r"""
-\textbf{\texttt{-{}-t-decades 1}} (default 2) --- the width of the temperature
-schedule. The annealing does not take $T_0$ as an argument: \texttt{calibrate\_T0}
-samples worsening moves on the instance itself and solves for the $T_0$ at which
-a fraction \texttt{-{}-t-accept} of them would be accepted ($0.1\,\%$ by
-default). From there the temperature decays geometrically to
-$T_{\text{end}} = T_0 \cdot 10^{-D}$, one factor
-$\alpha = 10^{-D/(\text{steps}-1)}$ per step, with $D =$
-\texttt{-{}-t-decades}. So $D$ is \emph{how many orders of magnitude the
-temperature falls over the run}: $D=2$ ends a hundred times colder than it
-started, $D=1$ only ten times colder.
-""")
-    doc.p(r"""
-Lowering $D$ keeps the search warm for longer. The realised acceptance rate over
-the whole run goes $0.9\,\%$ at $D=4$, $1.1\,\%$ at $D=3$, $1.5\,\%$ at the
-default $D=2$, $2.6\,\%$ at $D=1$ --- and the cost falls monotonically along that
-sequence. The reading is that the default schedule freezes too early: it reaches
-temperatures at which essentially nothing is accepted well before the step budget
-runs out, and those steps are wasted. Widening the schedule further ($D=3$, $D=4$)
-makes it strictly worse, by $+0.27\,\%$ and $+0.41\,\%$.
-""")
-    doc.p(r"""
-\textbf{\texttt{-{}-lambda 1.4} and \texttt{-{}-mu 0.2}} (defaults 1 and 0) ---
-the shape of the Clarke \& Wright savings criterion,
-\[
-  s(i,j) \;=\; d_{0i} + d_{0j} \;-\; \lambda\, d_{ij}
-                \;+\; \mu\,\lvert d_{0i} - d_{0j}\rvert .
-\]
-At $\lambda=1$, $\mu=0$ this is the original 1964 criterion: the distance saved
-by serving $i$ and $j$ on one route rather than two separate out-and-back trips.
-The construction merges route endpoints in decreasing $s$ while capacity allows,
-so $s$ decides nothing but the \emph{order} in which pairs are considered ---
-which is enough to determine the whole solution.
-""")
-    doc.p(r"""
-$\lambda$ reweights the direct link $d_{ij}$ against the two depot legs. Raising
-it above 1 makes the criterion more sceptical of long links, so only genuinely
-close pairs are merged early; the routes that come out are more compact and less
-radial. $\mu$ adds a bonus for merging two customers that sit at \emph{different}
-distances from the depot, which favours routes that run outward and sweep back
-rather than joining two customers on the same ring.
-""")
-    doc.p(r"""
-The two interact, and neither is any good alone: at $\lambda=1.4$, $\mu=0$ the
-construction is $+0.34\,\%$ \emph{worse} than the default, and $\mu=1$ at the
-same $\lambda$ is $+1.30\,\%$ worse. It is the combination $\lambda \approx 1.4$
-with a small positive $\mu$ that wins, and that is a fact about this instance
-family --- uniform points on a square, where the depot is not central by
-construction --- not a universal constant. On clustered instances the optimum
-will move.
-""")
+    doc.sub("What the changed options do")
+    seen_notes = []
+    for key in changed:                    # lambda/mu and race/race-at share
+        blk = OPTION_NOTES.get(key)        # a note; emit each at most once
+        if blk and blk not in seen_notes:
+            seen_notes.append(blk)
+            doc.p(blk)
+    if not seen_notes:
+        doc.p("See the section for each knob above for what it controls.")
     doc.note(r"""
-\textbf{Both of these are conditional on the budget.} \texttt{-{}-t-decades} was
-tuned at $\texttt{-{}-sa-steps} = %s$ and controls how fast the temperature
-reaches the point where nothing is accepted; that trade-off is different at
-$10^4$ or $10^6$ steps. Re-run the \texttt{temp} study if you change the budget
-substantially. The savings parameters are the more portable of the two, but they
-were still tuned on one instance family.
+\textbf{These are conditional on the budget and on the instance family.}
+Everything above was tuned at $\texttt{-{}-sa-steps} = %s$ on uniform points in
+a square. The temperature schedule in particular trades off against the budget
+by construction --- re-run the \texttt{temp} study if you change it
+substantially --- and the savings parameters were fitted to one geometry.
 """ % f"{steps:,}")
 
     if not do_run:
@@ -1746,10 +2436,14 @@ were still tuned on one instance family.
     print("  verifying the recommended configuration...")
     for label, sd in (("sweep seed (in-sample)", seed), ("fresh seed", fresh)):
         for n in (50, 100, 200):
-            src = ["--random", "-n", str(n), "-m", str(m), "--seed", str(sd),
-                   "--sa-steps", str(steps)]
-            b = run_cw(binary, src, os.path.join(bdir, f"s{sd}_n{n}_default"))
-            t = run_cw(binary, src + flags, os.path.join(bdir, f"s{sd}_n{n}_tuned"))
+            src = ["--random", "-n", str(n), "-m", str(m), "--seed", str(sd)]
+            # equal TOTAL budget on both sides: the default runs one start of
+            # `steps`, the recommendation runs `nrestarts` starts of
+            # `tuned_steps` each
+            b = run_cw(binary, src + ["--sa-steps", str(steps)],
+                       os.path.join(bdir, f"s{sd}_n{n}_default"))
+            t = run_cw(binary, src + ["--sa-steps", str(tuned_steps)] + flags,
+                       os.path.join(bdir, f"s{sd}_n{n}_tuned"))
             if not (b.ok and t.ok):
                 continue
             s = paired(b, t)
@@ -1763,10 +2457,15 @@ separately do not add up. It is checked on the sweep's own instances and on a
 seed the sweep never saw --- the difference between the two is the selection bias
 made visible.
 """)
+        cap = ("The recommended configuration against the stock defaults, at "
+               "equal SA budget. The fresh-seed rows are the honest estimate.")
+        if nrestarts > 1:
+            cap += (" The recommendation uses %d restarts of %s steps against "
+                    "the default's single run of %s, so both sides spend the "
+                    "same total." % (nrestarts, f"{tuned_steps:,}",
+                                     f"{steps:,}"))
         doc.table(["instances", r"$n$", "default", "recommended", *DHEAD], rows,
-                  "The recommended configuration against the stock defaults, at "
-                  "equal SA budget. The fresh-seed rows are the honest estimate.",
-                  align="lrrrrrr")
+                  cap, align="lrrrrrr")
 
 
 # ------------------------------------------------------------ the document
@@ -1851,8 +2550,9 @@ def main():
         overview(runs, figdir, doc, ks)
     except Exception as e:
         print(f"  !! overview: {e}", file=sys.stderr)
-    for fn in (study_init, study_ops, study_knn, study_timing, study_restarts,
-               study_split, study_pick, study_temp, study_construct, study_tuned):
+    for fn in (study_init, study_ops, study_newops, study_knn, study_timing,
+               study_restarts, study_split, study_pick, study_select,
+               study_race, study_temp, study_construct, study_tuned):
         try:
             fn(runs, figdir, doc)
         except Exception as e:                      # one broken study must not
@@ -1879,6 +2579,27 @@ def main():
         run; and at $K=0$ the vertex-selection rule is silently forced to
         uniform (\texttt{cw.c:1676}) while the header still prints the requested
         \texttt{-{}-pick}. That is a reporting bug worth fixing in \texttt{cw}.
+  \item \textbf{One machine, for the wall-time results.} The iso-time reading in
+        Section~\ref{sec:newops} and the interleaving speed-up in
+        Section~\ref{sec:race} are the only conclusions here that depend on the
+        hardware. Both were measured on one laptop with all threads busy; the
+        cost ratios will move on a machine with a different cache hierarchy, and
+        the interleaving result in particular is a cache effect by construction.
+  \item \textbf{Knobs that need each other are invisible to the frame.} Every
+        knob is swept with everything else at its default, so a knob that only
+        pays in the presence of another cannot show up. Racing is the clear
+        case --- significant on its own measurement, dropped from the
+        recommendation, and worth having as soon as \texttt{-{}-restarts} is
+        raised. Section~\ref{sec:tuned} is the only part of this document that
+        looks at combinations at all.
+  \item \textbf{Where this disagrees with its source.} \texttt{-{}-vrank} and
+        \texttt{-{}-sa-knn 30} were ported from an implementation that reports
+        them as a win, and here they lose consistently across the whole grid.
+        The likely cause is that the other implementation shares one $K=30$
+        neighbour list between the savings construction and the annealing while
+        this one builds exact savings up to $n = 1500$, so the two are not the
+        same baseline. This sweep can say the setting does not pay \emph{here};
+        it cannot say the original measurement was wrong.
 \end{itemize}
 """)
 

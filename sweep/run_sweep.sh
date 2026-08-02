@@ -24,6 +24,11 @@
 set -u
 shopt -s inherit_errexit 2>/dev/null || true
 
+# awk's printf honours the locale, so under e.g. fr_FR the wall times land in
+# the .meta files as "0,055" and the analysis cannot read them back. Everything
+# written here is data, not user-facing text, so pin the numeric locale.
+export LC_ALL=C
+
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 BIN=${BIN:-$ROOT/cw}
 OUT=${OUT:-$ROOT/sweep/results}
@@ -35,7 +40,8 @@ N=${N:-100}             # default dimension
 STEPS=${STEPS:-100000}  # default SA budget
 RESUME=${RESUME:-0}     # 1 = skip a run whose .meta already exists
 
-STUDIES=(init ops knn timing restarts split pick temp construct tuned)
+STUDIES=(init ops newops knn timing restarts split pick select race temp
+         construct tuned)
 
 n_run=0; n_skip=0; n_fail=0
 FAILED=()
@@ -126,6 +132,58 @@ study_ops() {
     # is 2..8 (cw.c:2042); segments are drawn uniformly in [2, or_max].
     for L in 2 3 4 5 6 7 8; do
         run ops "ormax_$L" $(src "$N") --sa-steps "$STEPS" --ops 1,1,1,1 --or-max "$L"
+    done
+}
+
+# ============================================================== S2b newops
+# The two operators added in positions 5 and 6 of --ops: swap* (Vidal 2022) and
+# route opening. Both default to weight 0, so the baseline here is the stock
+# --ops 1,1,1,0,0,0.
+#
+# swap* costs O(L1+L2) per draw instead of O(1), so an equal-STEP win is not a
+# win. The `bud_` block is a budget ladder: the same four configurations swept
+# over six step counts, so the analysis can read cost against *measured wall
+# time* and interpolate an iso-time delta rather than trusting equal steps.
+study_newops() {
+    banner newops "swap* and route opening: weights, and the iso-time question"
+    local X E cfg mult steps n
+
+    # one operator at a time, against the stock default
+    for X in 0.25 0.5 1 2 4; do
+        run newops "sstar_$X" $(src "$N") --sa-steps "$STEPS" --ops "1,1,1,0,$X,0"
+    done
+    for E in 0.01 0.02 0.05 0.1 0.3 1; do
+        run newops "open_$E"  $(src "$N") --sa-steps "$STEPS" --ops "1,1,1,0,0,$E"
+    done
+
+    # combinations, including the "does swap* subsume swap" question. For a
+    # given pair the in-place exchange is one of the positions swap* sweeps, so
+    # delta(swap*) <= delta(swap) always -- but swap is ~10x cheaper per draw,
+    # so whether to keep it is a weighting question, not a dominance one.
+    for w in "1,1,1,0,1,0.05" "1,0,1,0,1,0.05" "1,0,1,0,1,0" \
+             "1,1,1,1,1,0.05" "1,0,1,1,1,0.05" "0,0,1,0,1,0.05"; do
+        run newops "mix_${w//,/-}" $(src "$N") --sa-steps "$STEPS" --ops "$w"
+    done
+
+    # Budget ladder for the iso-time comparison. The rungs are multiples of
+    # $STEPS rather than absolute counts, so the x1 rung is always the same run
+    # as the blocks above -- which is what makes it a valid baseline for them.
+    for cfg in "def:1,1,1,0,0,0" "sstar:1,1,1,0,1,0" \
+               "sstaropen:1,1,1,0,1,0.05" "dropswap:1,0,1,0,1,0.05"; do
+        for mult in "x0125 1 8" "x025 1 4" "x05 1 2" \
+                    "x1 1 1" "x2 2 1" "x4 4 1"; do
+            set -- $mult                       # $1=tag  $2=numerator  $3=denom
+            steps=$(( STEPS * $2 / $3 ))
+            [[ $steps -lt 1 ]] && steps=1
+            run newops "bud_${cfg%%:*}_$1" \
+                $(src "$N") --sa-steps "$steps" --ops "${cfg#*:}"
+        done
+    done
+
+    # does the gain survive across dimension?
+    for n in 20 50 100 200 500; do
+        run newops "n${n}_off" $(src "$n") --sa-steps "$STEPS"
+        run newops "n${n}_on"  $(src "$n") --sa-steps "$STEPS" --ops 1,1,1,0,1,0.05
     done
 }
 
@@ -255,6 +313,75 @@ study_pick() {
     done
 }
 
+# ============================================================== S7b select
+# Biases on the SECOND vertex v, and the relocate insertion side. All three
+# default to the neutral setting, so the baseline is the plain default run.
+#
+# --vrank is claimed to be *coupled* with --sa-knn: the longer list gives the
+# reach, the rank bias restores the concentration, and either alone is supposed
+# to hurt. That claim is only testable on the full grid, hence the cross.
+study_select() {
+    banner select "--vrank x --sa-knn, --pick2, --reloc-side"
+    local V K T S
+    for V in 1 2 3 4; do
+        for K in 10 20 30 50; do
+            run select "vrank${V}_K${K}" $(src "$N") --sa-steps "$STEPS" \
+                --vrank "$V" --sa-knn "$K"
+        done
+    done
+    for T in 1 2 3 4 8; do
+        run select "pick2_$T" $(src "$N") --sa-steps "$STEPS" --pick2 "$T"
+    done
+    # the insertion side, alone and with swap* active -- an informed side may
+    # matter more or less depending on what else is reshaping the routes
+    for S in coin long; do
+        run select "side_${S}"       $(src "$N") --sa-steps "$STEPS" --reloc-side "$S"
+        run select "side_${S}_sstar" $(src "$N") --sa-steps "$STEPS" \
+            --reloc-side "$S" --ops 1,1,1,0,1,0.05
+    done
+    # and across dimension, since the kNN list length is n-dependent
+    for n in 50 200 500; do
+        run select "n${n}_plain"  $(src "$n") --sa-steps "$STEPS"
+        run select "n${n}_vrank2" $(src "$n") --sa-steps "$STEPS" --vrank 2 --sa-knn 30
+    done
+}
+
+# ============================================================== S7c race
+# Budget redistribution between restarts, and the two-chain interleaving.
+#
+# Racing only means anything at equal TOTAL budget, so every run here holds
+# restarts * sa-steps constant. --pair is a pure engineering change: without
+# --race the trajectories are identical bit for bit, so the cost column must be
+# flat and only the wall time may move. With --race it also changes the
+# schedule, because racing makes the budget depend on how starts are grouped.
+study_race() {
+    banner race "--race margin x --race-at, and --pair interleaving"
+    local BUDGET=400000 R S MARGIN AT n
+
+    R=10; S=$((BUDGET / R))
+    for MARGIN in off 0.0005 0.002 0.01 0.05 0.2; do
+        run race "margin_${MARGIN}" $(src "$N") --sa-steps "$S" --restarts "$R" \
+            --race "$MARGIN"
+    done
+    for AT in 0.1 0.25 0.5 0.75; do
+        run race "at_${AT}" $(src "$N") --sa-steps "$S" --restarts "$R" \
+            --race 0.002 --race-at "$AT"
+    done
+    # racing needs starts to race: how does the gain scale with their number?
+    for R in 2 4 8 16 32; do
+        S=$((BUDGET / R))
+        run race "R${R}_off"  $(src "$N") --sa-steps "$S" --restarts "$R" --race off
+        run race "R${R}_on"   $(src "$N") --sa-steps "$S" --restarts "$R" --race 0.002
+    done
+    # --pair: cost must not move (no --race), wall time should, from n large
+    # enough that a chain's state spills out of L1/L2
+    for n in 100 500 1000 2000; do
+        S=$((BUDGET / 8))
+        run race "pair0_n${n}" $(src "$n") --sa-steps "$S" --restarts 8 --pair 0
+        run race "pair1_n${n}" $(src "$n") --sa-steps "$S" --restarts 8 --pair 1
+    done
+}
+
 # ============================================================== S8  temp
 # Annealing schedule: initial acceptance target and the number of decades
 # spanned by T.
@@ -313,6 +440,16 @@ study_tuned() {
             --pick-crit rem --split both --split-every 1000
         run tuned "n${n}_all_r8"   $(src "$n") --sa-steps $((STEPS / 8)) --restarts 8 \
             --ops 1,1,1,1 --pick-crit rem --split both --split-every 1000
+
+        # the new operators, alone and folded into the combination above
+        run tuned "n${n}_newops"   $(src "$n") --sa-steps "$STEPS" --ops 1,1,1,0,1,0.05
+        run tuned "n${n}_newall"   $(src "$n") --sa-steps "$STEPS" --ops 1,1,1,0,1,0.05 \
+            --reloc-side long --split both --split-every 1000
+        # multi-restart, where racing has something to redistribute
+        run tuned "n${n}_r8"       $(src "$n") --sa-steps $((STEPS / 8)) --restarts 8
+        run tuned "n${n}_newall_r8" $(src "$n") --sa-steps $((STEPS / 8)) --restarts 8 \
+            --ops 1,1,1,0,1,0.05 --reloc-side long --race 0.002 \
+            --split both --split-every 1000
     done
 }
 

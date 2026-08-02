@@ -5,7 +5,7 @@ figures and a report.
 
 ```sh
 make                        # build ./cw first
-sweep/run_sweep.sh          # ~2 min, 346 runs, writes sweep/results/
+sweep/run_sweep.sh          # ~5 min, 468 runs, writes sweep/results/
 uv run sweep/analyze_sweep.py   # writes sweep/figures/, report.tex, report.pdf
 ```
 
@@ -58,15 +58,36 @@ adding an option to a study needs no change on the analysis side.
 | name | question |
 |---|---|
 | `init` | `--init random` vs `cw`, budget 10³→10⁶, at n = 20/50/100/200 |
-| `ops` | all 15 non-empty operator subsets, unbalanced weights, `--or-max` |
+| `ops` | all 15 non-empty subsets of the four original operators, unbalanced weights, `--or-max` |
+| `newops` | `swap*` and route-opening weights, mixtures, and a **budget ladder for the iso-time reading** |
 | `knn` | `--sa-knn` ∈ {0,5,10,20,30,50} × n ∈ {20,50,100,200} |
 | `timing` | construction vs annealing cost across n; thread scaling |
 | `restarts` | `--restarts` at fixed and at **equal total budget**; `--cw-rand`, `--cw-alpha` |
 | `split` | `--split` × `--split-every` grid, `--split-tour`, and the same at larger n |
 | `pick` | `--pick` × `--pick-crit`, `--pick-eps`, and the `--pick` × `--sa-knn` interaction |
+| `select` | `--vrank` × `--sa-knn` (the coupling claim), `--pick2`, `--reloc-side` |
+| `race` | `--race` × `--race-at` at **equal total budget**, scaling with restart count, and `--pair` |
 | `temp` | `--t-accept` × `--t-decades` |
 | `construct` | `--lambda` × `--mu` with and without SA; `--knn`/`--exact`; `--2opt` |
 | `tuned` | candidate combinations against the stock defaults, at equal budget |
+
+Two of these need a word on how they are set up.
+
+**`newops` measures against the clock, not the step count.** `swap*` is the only
+non-elementary operator in the solver — `O(L₁+L₂)` per draw where everything else
+is `O(1)` — so an equal-step win is not a win. The study therefore sweeps four
+configurations over a 32× range of budgets (`bud_<cfg>_x0125` … `_x4`, multiples
+of `$STEPS`) and the report interpolates both curves in log(wall time). The `x1`
+rung is by construction the same run as the weight blocks, which is what makes it
+a valid baseline for them; the analysis checks that and refuses to plot if the
+budgets ever disagree.
+
+**`race` and `pair` only mean anything at equal total budget.** Every run in the
+`race` study holds `restarts × sa-steps` constant, because racing redistributes a
+budget rather than adding to one. `--pair` is a pure engineering change: without
+`--race` the two interleaved chains follow identical trajectories, so the report
+prints an *identical* column that must read `yes` on every row — if it does not,
+the interleaving has broken something.
 
 ## Why the numbers are trustworthy
 
