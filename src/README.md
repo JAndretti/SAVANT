@@ -55,7 +55,7 @@ comparison in the acceptance test, diverging the whole trajectory. Use
 **`MAXN` is 65535** because savings pack `i` and `j` into 16 bits each inside an
 8-byte record (`Sav`). Raising the limit means widening that record.
 
-**`--init random` skips the savings path entirely** (src/cw.c:1526): no savings
+**`--init random` skips the savings path entirely** (src/cw.c:1855): no savings
 list is built, no sort, no merge. `--knn`, `--exact`, `--lambda`, `--mu`,
 `--cw-rand` and `--cw-alpha` therefore have no effect on that path, and the
 savings buffer is not even allocated. Each restart draws its own permutation, so

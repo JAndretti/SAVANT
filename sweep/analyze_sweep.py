@@ -11,7 +11,7 @@ dict from the recorded command line, and produces:
     sweep/report.pdf        compiled with pdflatex, when it is installed
 
 Every run of a study uses the same (n, m, seed), so instance k is byte-identical
-across runs (cw.c:2064 seeds instance k with seed+k). Comparisons are therefore
+across runs (cw.c:2574 seeds instance k with seed+k). Comparisons are therefore
 *paired*: we compare cost_i(A) with cost_i(B) on the same instance and report the
 mean of the differences, its 95 % CI, and a distribution-free sign test. That is
 far tighter than comparing two means with independent standard deviations.
@@ -573,14 +573,14 @@ probabilities of the four neighbourhood moves the annealing draws from. Each
 move first picks a vertex $u$ (Section~\ref{sec:pick}) and a partner $v$ near it
 (Section~\ref{sec:knn}), then:
 \begin{itemize}\itemsep2pt
-  \item \textbf{relocate} (\texttt{mv\_relocate}, \texttt{cw.c:980}) --- take $u$
+  \item \textbf{relocate} (\texttt{mv\_relocate}, \texttt{cw.c:1040}) --- take $u$
         out of its route and re-insert it next to $v$, possibly in another route.
-  \item \textbf{swap} (\texttt{mv\_swap}, \texttt{cw.c:1017}) --- exchange the
+  \item \textbf{swap} (\texttt{mv\_swap}, \texttt{cw.c:1083}) --- exchange the
         positions of $u$ and $v$.
-  \item \textbf{2-opt} (\texttt{mv\_2opt}, \texttt{cw.c:1137}) --- replace the two
+  \item \textbf{2-opt} (\texttt{mv\_2opt}, \texttt{cw.c:1362}) --- replace the two
         edges carried by $u$ and $v$ by the other pairing; inside one route this
         reverses a segment, across two routes it exchanges their tails.
-  \item \textbf{or-opt} (\texttt{mv\_oropt}, \texttt{cw.c:1082}) --- move a whole
+  \item \textbf{or-opt} (\texttt{mv\_oropt}, \texttt{cw.c:1148}) --- move a whole
         run of 2 to \texttt{-{}-or-max} consecutive customers starting at $u$,
         optionally reversed, next to $v$.
 \end{itemize}
@@ -645,7 +645,7 @@ weighting right, and is or-opt off for a good reason?
         doc.table([r"\texttt{-{}-or-max}", "mean cost", *DHEAD], orows,
                   "Or-opt segment length, with or-opt enabled "
                   "(\\texttt{-{}-ops 1,1,1,1}). Valid range is 2--8 "
-                  "(\\texttt{cw.c:2042}).", align="rrrrr")
+                  "(\\texttt{cw.c:2546}).", align="rrrrr")
     doc.p(r"""
 \textbf{Reading.} The default subset wins: every other subset is worse, and
 turning or-opt on costs a small but significant amount. Or-opt overlaps with
@@ -666,15 +666,15 @@ def study_knn(runs, out, doc):
     doc.sec("Candidate neighbourhood", "sec:knn")
     doc.p(r"""
 \textbf{What it controls.} Once a move has picked the vertex $u$, it needs a
-partner $v$. \texttt{sa\_cand} (\texttt{cw.c:971}) draws $v$ uniformly from the
+partner $v$. \texttt{sa\_cand} (\texttt{cw.c:1010}) draws $v$ uniformly from the
 $K$ nearest neighbours of $u$, with $K=$ \texttt{-{}-sa-knn}; at $K=0$ it draws
 uniformly from all customers. This is what keeps a move geometrically local, so
 that the cost delta has a chance of being negative. $K$ is clamped to $n-1$
-(\texttt{cw.c:1399}).
+(\texttt{cw.c:1675}).
 """)
     doc.note(r"""
 $K$ does double duty: at $K=0$ the kNN lists are not built, and
-\texttt{cw.c:1400} then \emph{silently} forces uniform vertex selection as well,
+\texttt{cw.c:1676} then \emph{silently} forces uniform vertex selection as well,
 whatever \texttt{-{}-pick} says. So $K=0$ disables two mechanisms, not one ---
 see Section~\ref{sec:pick}.
 """)
@@ -986,7 +986,7 @@ partition is one of the candidates, the result can never be worse.
 \texttt{-{}-split} says where to apply it: \texttt{cw} right after the
 construction, \texttt{end} after the annealing, \texttt{both}, or \texttt{off}.
 \texttt{-{}-split-every N} additionally applies it every $N$ annealing steps ---
-an independent code path (\texttt{cw.c:1440} versus \texttt{cw.c:1640/1658}), so
+an independent code path (\texttt{cw.c:1744} versus \texttt{cw.c:1968/2075}), so
 \texttt{off} combined with a period is a meaningful cell. \texttt{-{}-split-tour}
 chooses how the giant tour is built: routes in their current order,
 \texttt{sweep} by polar angle, or \texttt{both} keeping the better.
@@ -1082,7 +1082,7 @@ def study_pick(runs, out, doc):
     doc.sec("Vertex selection", "sec:pick")
     doc.p(r"""
 \textbf{What it controls.} Before a move can be built, the annealing must pick
-the vertex $u$ to disturb (\texttt{pick\_u}, \texttt{cw.c:952}). Uniform choice
+the vertex $u$ to disturb (\texttt{pick\_u}, \texttt{cw.c:987}). Uniform choice
 wastes draws on customers that are already well placed, so the code biases the
 choice by a \emph{regret} measure. With $\texttt{-{}-pick } T \ge 2$ it draws $T$
 customers uniformly and keeps the one with the largest regret (a tournament);
@@ -1106,7 +1106,7 @@ two edges $u$ currently carries:
 \texttt{-{}-pick-eps} sets how peaked the $T=0$ sampler is.
 """)
     doc.note(r"""
-The code's own comment (\texttt{cw.c:911--916}) notes that \texttt{lb} ``can stay
+The code's own comment (\texttt{cw.c:938--916}) notes that \texttt{lb} ``can stay
 large for an isolated customer even when nothing can improve it any further'',
 whereas \texttt{rem} is zero as soon as $u$ sits well. That suggests the default
 wastes draws on structurally irreducible vertices. The grid below was run
@@ -1188,7 +1188,7 @@ specifically to test that prediction.
                   irows,
                   "\\texttt{-{}-pick} crossed with \\texttt{-{}-sa-knn}, paired "
                   "against \\texttt{-{}-pick 1} at the same $K$. The $K=0$ rows are "
-                  "exactly zero because \\texttt{cw.c:1400} forces uniform "
+                  "exactly zero because \\texttt{cw.c:1676} forces uniform "
                   "selection there --- while the run header still prints the "
                   "requested rule.", align="rrrrrr")
     doc.p(r"""
@@ -1802,7 +1802,7 @@ Kool/NeuOpt law (coordinates $U[0,1]^2$, demands $U\{1,\dots,9\}$, capacity from
 \texttt{-{}-sa-steps}~$=$~@STEPS@.
 
 \textbf{Every comparison is paired.} Instance $k$ is generated from
-\texttt{seed}~$+~k$ (\texttt{cw.c:2064}), so all runs of a study see
+\texttt{seed}~$+~k$ (\texttt{cw.c:2574}), so all runs of a study see
 byte-identical instances. Rather than comparing two means with their independent
 standard deviations, we compare $\mathrm{cost}_i(A)$ with $\mathrm{cost}_i(B)$ on
 the same instance $i$ and report the mean of the @M@ differences with a
@@ -1875,9 +1875,9 @@ def main():
         \emph{because} it scored lowest. The fresh-seed rows in
         Section~\ref{sec:best} are the only bias-free numbers in this document.
   \item \textbf{\texttt{-{}-sa-knn} is clamped} to $n-1$
-        (\texttt{cw.c:1399}), so at $n=20$ the settings $K \ge 20$ are the same
+        (\texttt{cw.c:1675}), so at $n=20$ the settings $K \ge 20$ are the same
         run; and at $K=0$ the vertex-selection rule is silently forced to
-        uniform (\texttt{cw.c:1400}) while the header still prints the requested
+        uniform (\texttt{cw.c:1676}) while the header still prints the requested
         \texttt{-{}-pick}. That is a reporting bug worth fixing in \texttt{cw}.
 \end{itemize}
 """)

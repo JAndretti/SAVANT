@@ -156,10 +156,12 @@ typedef struct {
     /* simulated annealing */
     int    sa_steps, sa_knn, check, split, split_every, split_tour;
     int    restarts, cw_rand, pick_t, pick_crit;
+    int    pick2, vrank, reloc_side, pair;   /* new, all neutral by default */
+    double race, race_at;                    /* racing between starts       */
     double pick_eps;
     double cw_alpha;
     double sa_t0, sa_tend, sa_chi0, sa_decades;
-    double w_rel, w_swap, w_2opt, w_or;
+    double w_rel, w_swap, w_2opt, w_or, w_sstar, w_open;
     int    or_max;
 } Opts;
 
@@ -416,6 +418,10 @@ typedef struct {
     int    *flat, *rstart;
     int    *s_nxt, *s_prv, *s_rid;   double *s_load;
     int    *b_nxt, *b_prv, *b_rid;   double *b_load;
+    /* second annealing chain (--pair interleaving) */
+    int    *s2_nxt, *s2_prv, *s2_rid; double *s2_load;
+    int    *b2_nxt, *b2_prv, *b2_rid; double *b2_load;
+    double *inc2, *bnx2, *bad2;
     int    *r_nxt, *r_prv, *r_rid;   double *r_load;
     int    *bufA, *bufB, *bufC, *bufD;
     int    *tour, *spPred, *spDq;
@@ -426,9 +432,14 @@ typedef struct {
     double  t0_used, gsplit;
     double *xy;
     int     rounded;
-    double *lb, *bad, *inc, *fen, *fen_wv, fen_tot, eps0;
-    int     fen_pw, crit, or_max;
-    uint32_t th1, th2, th3;
+    /* inc/bnx/bad are VIEWS rebound by chain_bind onto the owned buffers
+       (inc_o/... for chain 0, inc2/... for chain 1); ws_ensure only
+       reallocates the owned buffers and resets the views onto chain 0. */
+    double *lb, *bad, *inc, *bnx, *fen, *fen_wv, fen_tot, eps0;
+    double *inc_o, *bnx_o, *bad_o;
+    int     xy_ok, lb_k;              /* per-instance caches */
+    int     fen_pw, crit, or_max, pick2, vrank, reloc_side, need_bnx;
+    uint32_t th1, th2, th3, th4, th5;
     Inst    scratch;        /* instance generated on the fly      */
     int     scratch_cap;
 } WS;
@@ -458,14 +469,26 @@ static void ws_ensure(WS *w, int n, int K, size_t nsav)
         w->b_rid  = (int *)xrealloc(w->b_rid,  z * sizeof(int));
         w->s_load = (double *)xrealloc(w->s_load, (size_t)(c + 2) * sizeof(double));
         w->b_load = (double *)xrealloc(w->b_load, (size_t)(c + 2) * sizeof(double));
+        w->s2_nxt = (int *)xrealloc(w->s2_nxt, z * sizeof(int));
+        w->s2_prv = (int *)xrealloc(w->s2_prv, z * sizeof(int));
+        w->s2_rid = (int *)xrealloc(w->s2_rid, z * sizeof(int));
+        w->b2_nxt = (int *)xrealloc(w->b2_nxt, z * sizeof(int));
+        w->b2_prv = (int *)xrealloc(w->b2_prv, z * sizeof(int));
+        w->b2_rid = (int *)xrealloc(w->b2_rid, z * sizeof(int));
+        w->s2_load = (double *)xrealloc(w->s2_load, (size_t)(c + 2) * sizeof(double));
+        w->b2_load = (double *)xrealloc(w->b2_load, (size_t)(c + 2) * sizeof(double));
+        w->inc2   = (double *)xrealloc(w->inc2,   (size_t)(c + 2) * sizeof(double));
+        w->bnx2   = (double *)xrealloc(w->bnx2,   (size_t)(c + 2) * sizeof(double));
+        w->bad2   = (double *)xrealloc(w->bad2,   (size_t)(c + 2) * sizeof(double));
         w->r_nxt  = (int *)xrealloc(w->r_nxt, z * sizeof(int));
         w->r_prv  = (int *)xrealloc(w->r_prv, z * sizeof(int));
         w->r_rid  = (int *)xrealloc(w->r_rid, z * sizeof(int));
         w->r_load = (double *)xrealloc(w->r_load, (size_t)(c + 2) * sizeof(double));
         w->lb     = (double *)xrealloc(w->lb,     (size_t)(c + 2) * sizeof(double));
-        w->bad    = (double *)xrealloc(w->bad,    (size_t)(c + 2) * sizeof(double));
+        w->bad_o  = (double *)xrealloc(w->bad_o,  (size_t)(c + 2) * sizeof(double));
         w->xy     = (double *)xrealloc(w->xy, (size_t)(4 * c + 12) * sizeof(double));
-        w->inc    = (double *)xrealloc(w->inc,    (size_t)(c + 2) * sizeof(double));
+        w->inc_o  = (double *)xrealloc(w->inc_o,  (size_t)(c + 2) * sizeof(double));
+        w->bnx_o  = (double *)xrealloc(w->bnx_o,  (size_t)(c + 2) * sizeof(double));
         w->fen    = (double *)xrealloc(w->fen,    (size_t)(c + 2) * sizeof(double));
         w->fen_wv = (double *)xrealloc(w->fen_wv, (size_t)(c + 2) * sizeof(double));
         w->bufA = (int *)xrealloc(w->bufA, (size_t)(c + 2) * sizeof(int));
@@ -487,6 +510,7 @@ static void ws_ensure(WS *w, int n, int K, size_t nsav)
         w->nbr = (int *)xrealloc(w->nbr, need * sizeof(int));
         w->cap_nbr = need;
     }
+    w->inc = w->inc_o; w->bnx = w->bnx_o; w->bad = w->bad_o;   /* views */
     if (K > w->cap_k) {
         w->hd  = (double *)xrealloc(w->hd,  (size_t)(K + 1) * sizeof(double));
         w->hid = (int *)   xrealloc(w->hid, (size_t)(K + 1) * sizeof(int));
@@ -512,7 +536,10 @@ static void ws_free(WS *w)
     free(w->flat); free(w->rstart);
     free(w->s_nxt); free(w->s_prv); free(w->s_rid); free(w->s_load);
     free(w->b_nxt); free(w->b_prv); free(w->b_rid); free(w->b_load);
-    free(w->r_nxt); free(w->r_prv); free(w->r_rid); free(w->r_load); free(w->xy); free(w->lb); free(w->bad); free(w->inc); free(w->fen); free(w->fen_wv);
+    free(w->s2_nxt); free(w->s2_prv); free(w->s2_rid); free(w->s2_load);
+    free(w->b2_nxt); free(w->b2_prv); free(w->b2_rid); free(w->b2_load);
+    free(w->inc2); free(w->bnx2); free(w->bad2);
+    free(w->r_nxt); free(w->r_prv); free(w->r_rid); free(w->r_load); free(w->xy); free(w->lb); free(w->bad_o); free(w->inc_o); free(w->bnx_o); free(w->fen); free(w->fen_wv);
     free(w->bufA); free(w->bufB); free(w->bufC); free(w->bufD);
     free(w->tour); free(w->spPred); free(w->spDq);
     free(w->spD); free(w->spC); free(w->spP); free(w->spF); free(w->spAng);
@@ -924,10 +951,15 @@ static inline double bad_of(const Inst *in, const WS *w, const Sol *S, int u)
     return c > 0.0 ? c : 0.0;
 }
 
+/* bnx[u] = length of the downstream edge (u, nxt[u]) alone. Free to keep here
+   (the value is computed for inc[u] anyway) and read by the informed
+   insertion side of relocate (--reloc-side long). */
 static inline void inc_upd(const Inst *in, WS *w, const Sol *S, int u)
 {
     if (u < 1 || u > S->n) return;
-    w->inc[u] = dxy(w, S->prv[u], u) + dxy(w, u, S->nxt[u]);
+    double dn = dxy(w, u, S->nxt[u]);
+    w->inc[u] = dxy(w, S->prv[u], u) + dn;
+    w->bnx[u] = dn;
     if (w->pick_t != 1) w->bad[u] = bad_of(in, w, S, u);
     if (w->pick_t == 0) fen_set(w, S->n, u, fen_w(w, u));
 }
@@ -935,8 +967,11 @@ static inline void inc_upd(const Inst *in, WS *w, const Sol *S, int u)
 static void inc_build(const Inst *in, WS *w, const Sol *S)
 {
     const int n = S->n;
-    for (int u = 1; u <= n; u++)
-        w->inc[u] = dxy(w, S->prv[u], u) + dxy(w, u, S->nxt[u]);
+    for (int u = 1; u <= n; u++) {
+        double dn = dxy(w, u, S->nxt[u]);
+        w->inc[u] = dxy(w, S->prv[u], u) + dn;
+        w->bnx[u] = dn;
+    }
     if (w->pick_t != 1)
         for (int u = 1; u <= n; u++) w->bad[u] = bad_of(in, w, S, u);
     if (w->pick_t == 0) fen_rebuild(w, n);
@@ -967,12 +1002,37 @@ static inline int pick_u(const Inst *in, WS *w, const Sol *S, Rng *rng)
     return best;
 }
 
-/* draw a candidate vertex "close" to u (or uniform if the list is empty) */
+/* draw a candidate vertex "close" to u (or uniform if the list is empty).
+   The kNN lists are sorted by distance, so a bias towards the *nearest*
+   neighbours costs no memory access at all: the index is the minimum of
+   `--vrank` uniform draws (P(rank r) decreases linearly for T=2,
+   quadratically for T=3). vrank=1 gives back the plain uniform draw. */
 static inline int sa_cand(const WS *w, int n, int K, Rng *rng, int u)
 {
     if (K <= 0) return 1 + rng_idx(rng, n);
-    int v = w->nbr[(size_t)(u - 1) * K + rng_idx(rng, K)];
+    int idx = rng_idx(rng, K);
+    for (int t = 1; t < w->vrank; t++) {
+        int i2 = rng_idx(rng, K);
+        if (i2 < idx) idx = i2;
+    }
+    int v = w->nbr[(size_t)(u - 1) * K + idx];
     return (v >= 1 && v <= n) ? v : 1 + rng_idx(rng, n);
+}
+
+/* Second vertex with a tournament (--pick2): T candidates among the kNN of u,
+   keep the one with the largest global regret inc - lb. pick2=1 falls back to
+   a single sa_cand draw, i.e. exactly the previous behaviour. The regret is
+   read on the fly (inc[] is maintained, lb[] is static), so the tournament
+   does not depend on the criterion chosen for the first vertex. */
+static inline int sa_cand2(const WS *w, int n, int K, Rng *rng, int u)
+{
+    int v = sa_cand(w, n, K, rng, u);
+    for (int t = 1; t < w->pick2; t++) {
+        int c = sa_cand(w, n, K, rng, u);
+        if (c == v || c == u) continue;
+        if (v == u || w->inc[c] - w->lb[c] > w->inc[v] - w->lb[v]) v = c;
+    }
+    return v;
 }
 
 /* ------------------------------------------------------------- RELOCATE */
@@ -983,9 +1043,15 @@ static double mv_relocate(const Inst *in, WS *w, Sol *S, int K, double T, Rng *r
     int *nxt = S->nxt, *prv = S->prv, *rid = S->rid;
 
     int u = pick_u(in, w, S, rng);
-    int v = sa_cand(w, n, K, rng, u);
+    int v = sa_cand2(w, n, K, rng, u);
     if (v == u) return 0.0;
-    if (rng_bit(rng)) v = prv[v];              /* insert before v      */
+    /* Insertion side. `coin` (default) is a plain coin flip. `long` breaks
+       the longer of the two edges adjacent to v, which maximises the -d(v,q)
+       term of the insertion cost: two reads, no randomness. The diversity of
+       insertion positions is still carried by the draw of v among the kNN. */
+    if (w->reloc_side) { double dn = w->bnx[v];
+                         if (w->inc[v] - dn > dn) v = prv[v]; }
+    else if (rng_bit(rng)) v = prv[v];         /* insert before v      */
     if (v == u || v == prv[u]) return 0.0;
 
     int p = prv[u], sc = nxt[u], q = nxt[v];
@@ -1020,7 +1086,7 @@ static double mv_swap(const Inst *in, WS *w, Sol *S, int K, double T, Rng *rng, 
     int *nxt = S->nxt, *prv = S->prv, *rid = S->rid;
 
     int u = pick_u(in, w, S, rng);
-    int v = sa_cand(w, n, K, rng, u);
+    int v = sa_cand2(w, n, K, rng, u);
     if (v == u) return 0.0;
 
     int ru = rid[u], rv = rid[v];
@@ -1096,7 +1162,7 @@ static double mv_oropt(const Inst *in, WS *w, Sol *S, int K, double T, Rng *rng,
     int p = prv[seg[0]], q = nxt[seg[L - 1]];
     int ru = rid[seg[0]];
 
-    int v = sa_cand(w, n, K, rng, u);
+    int v = sa_cand2(w, n, K, rng, u);
     if (rng_bit(rng)) v = prv[v];
     if (v == p) return 0.0;                       /* null move */
     for (int t = 0; t < L; t++) if (v == seg[t]) return 0.0;
@@ -1132,6 +1198,165 @@ static double mv_oropt(const Inst *in, WS *w, Sol *S, int K, double T, Rng *rng,
     return delta;
 }
 
+/* -------------------------------------------------------------- SWAP*
+ * Vidal, "Hybrid genetic search for the CVRP: open-source implementation and
+ * SWAP* neighborhood", C&OR 2022.
+ *
+ * Exchanges two customers u and v of *different* routes without keeping their
+ * positions: each is reinserted at its best place in the other's route. That
+ * is what distinguishes it from `swap`, which forces u into v's slot. The two
+ * routes being disjoint, the two reinsertions are independent and the delta
+ * is exact.
+ *
+ * Cost O(L1 + L2) instead of O(1): the only non-elementary operator, hence a
+ * low default weight (5th position of --ops). It does not replace `swap`;
+ * both can be drawn together.
+ */
+
+static double mv_swapstar(const Inst *in, WS *w, Sol *S, int K, double T,
+                          Rng *rng, int probe)
+{
+    const int n = S->n;
+    int *nxt = S->nxt, *prv = S->prv, *rid = S->rid;
+
+    int u = pick_u(in, w, S, rng);
+    /* The neighbour w0 does not designate the exchange but the target ROUTE
+       -- swap* is a neighbourhood of route pairs, not of vertex pairs. v is
+       then the worse (by regret) of two uniform customers of that route:
+       widening to the whole route brings most of the measured gain, the
+       tournament a little more, and the deterministic argmax degrades (it
+       keeps reproposing the same incorrigible customers). */
+    int w0 = sa_cand2(w, n, K, rng, u);
+    if (w0 == u) return 0.0;
+    int ru = rid[u], rv = rid[w0];
+    if (ru == rv) return 0.0;                    /* inter-route only */
+
+    int *B0 = w->bufC, L2 = 0;                   /* target route, flattened */
+    {
+        int vd = VD(rv);
+        for (int c = nxt[vd]; c != vd; c = nxt[c]) B0[L2++] = c;
+    }
+    if (L2 < 1) return 0.0;
+    int v;
+    {
+        int c1 = B0[rng_idx(rng, L2)], c2 = B0[rng_idx(rng, L2)];
+        double s1 = w->inc[c1] - (K > 0 ? w->lb[c1] : 0.0);
+        double s2 = w->inc[c2] - (K > 0 ? w->lb[c2] : 0.0);
+        v = (s1 > s2) ? c1 : c2;
+    }
+
+    const double du = in->dem[u], dv = in->dem[v];
+    if (S->load[ru] - du + dv > in->cap + EPS) return 0.0;
+    if (S->load[rv] - dv + du > in->cap + EPS) return 0.0;
+
+    /* removal gains (inc[] is already maintained) */
+    double gu = w->inc[u] - dxy(w, prv[u], nxt[u]);
+    double gv = w->inc[v] - dxy(w, prv[v], nxt[v]);
+
+    /* --- best insertion of v into u's route, minus u --- */
+    double bi_v = 1e300; int aV = 0;
+    {
+        int vd = VD(ru), a = vd;
+        for (int c0 = nxt[vd]; ; c0 = nxt[c0]) {
+            int b = (c0 == vd) ? vd : c0;
+            if (b != u) {
+                double c = dxy(w, a, v) + dxy(w, v, b) - dxy(w, a, b);
+                if (c < bi_v) { bi_v = c; aV = a; }
+                a = b;
+            }
+            if (c0 == vd) break;
+        }
+    }
+
+    /* --- best insertion of u into the target route, minus v --- */
+    double bi_u = 1e300; int aU = 0;
+    {
+        int vd = VD(rv), a = vd;
+        for (int i2 = 0; ; i2++) {
+            int b = (i2 == L2) ? vd : B0[i2];
+            if (b != v) {
+                double c = dxy(w, a, u) + dxy(w, u, b) - dxy(w, a, b);
+                if (c < bi_u) { bi_u = c; aU = a; }
+                a = b;
+            }
+            if (i2 == L2) break;
+        }
+    }
+
+    double delta = bi_v + bi_u - gu - gv;
+    if (probe) return delta;
+    if (!sa_accept(delta, T, rng)) return 0.0;
+    w->acc++;
+
+    /* --- application: four O(1) splices, no rewrite --- */
+    int pu = prv[u], qu = nxt[u];
+    int pv = prv[v], qv = nxt[v];
+    nxt[pu] = qu; prv[qu] = pu;                  /* detach u */
+    nxt[pv] = qv; prv[qv] = pv;                  /* detach v */
+    int bV = nxt[aV], bU = nxt[aU];              /* read after the removals */
+    nxt[aV] = v; prv[v] = aV; nxt[v] = bV; prv[bV] = v;
+    nxt[aU] = u; prv[u] = aU; nxt[u] = bU; prv[bU] = u;
+    rid[u] = rv; rid[v] = ru;
+    /* loads recomputed as a fresh sum in route order -- identical to what
+       route_set does (the increment += dv - du lets ULPs drift, which ends up
+       flipping a capacity test) */
+    {   double sl = 0.0; int vd = VD(ru);
+        for (int c = nxt[vd]; c != vd; c = nxt[c]) sl += in->dem[c];
+        S->load[ru] = sl;
+        sl = 0.0; vd = VD(rv);
+        for (int c = nxt[vd]; c != vd; c = nxt[c]) sl += in->dem[c];
+        S->load[rv] = sl;
+    }
+    inc_upd(in, w, S, pu); inc_upd(in, w, S, qu);
+    inc_upd(in, w, S, aV); inc_upd(in, w, S, bV);
+    inc_upd(in, w, S, pv); inc_upd(in, w, S, qv);
+    inc_upd(in, w, S, aU); inc_upd(in, w, S, bU);
+    inc_upd(in, w, S, u);  inc_upd(in, w, S, v);
+    return delta;
+}
+
+/* -------------------------------------------------------------- OPEN
+ * Isolates u in an empty route (reused or created): delta = 2 d(0,u) minus
+ * the removal gain. Almost always worsening -- that is the point: the
+ * annealer can empty a route but never repopulate one, so the number of
+ * active routes is a one-way door between two Splits. This move reopens it,
+ * short of the intermediate states the annealer cannot cross. */
+
+static double mv_open(const Inst *in, WS *w, Sol *S, int K, double T,
+                      Rng *rng, int probe)
+{
+    const int n = S->n;
+    int *nxt = S->nxt, *prv = S->prv, *rid = S->rid;
+    (void)K;
+    int u = pick_u(in, w, S, rng);
+    int p = prv[u], q = nxt[u];
+    if (p == q && p > n) return 0.0;            /* u is already alone */
+
+    double delta = 2.0 * dxy(w, 0, u) + dxy(w, p, q) - w->inc[u];
+    if (probe) return delta;
+    if (!sa_accept(delta, T, rng)) return 0.0;
+
+    int r = -1;
+    if (S->R < n) {                              /* create a route */
+        r = S->R++;
+        int vd = VD(r);
+        nxt[vd] = prv[vd] = vd; rid[vd] = r; S->load[r] = 0.0;
+    } else {                                     /* otherwise reuse a husk */
+        for (int t = 0; t < S->R; t++)
+            if (nxt[VD(t)] == VD(t)) { r = t; break; }
+        if (r < 0) return 0.0;
+    }
+    w->acc++;
+    int ru = rid[u];
+    nxt[p] = q; prv[q] = p;
+    S->load[ru] -= in->dem[u];
+    int vd = VD(r);
+    nxt[vd] = u; prv[u] = vd; nxt[u] = vd; prv[vd] = u;
+    rid[u] = r; S->load[r] = in->dem[u];
+    inc_upd(in, w, S, p); inc_upd(in, w, S, q); inc_upd(in, w, S, u);
+    return delta;
+}
+
 /* ---------------------------------------------------------------- 2-OPT */
 
 static double mv_2opt(const Inst *in, WS *w, Sol *S, int K, double T, Rng *rng, int probe)
@@ -1140,7 +1365,7 @@ static double mv_2opt(const Inst *in, WS *w, Sol *S, int K, double T, Rng *rng, 
     int *nxt = S->nxt, *prv = S->prv, *rid = S->rid;
 
     int u = pick_u(in, w, S, rng);
-    int v = sa_cand(w, n, K, rng, u);
+    int v = sa_cand2(w, n, K, rng, u);
     if (v == u) return 0.0;
     int a = rng_bit(rng) ? prv[u] : u;        /* edge (a, nxt[a]) */
     int b = rng_bit(rng) ? prv[v] : v;        /* edge (b, nxt[b]) */
@@ -1165,8 +1390,16 @@ static double mv_2opt(const Inst *in, WS *w, Sol *S, int K, double T, Rng *rng, 
         int *buf = w->bufA, L = 0;
         for (int t = sa; ; t = nxt[t]) { buf[L++] = t; if (t == b) break; }
         int p = a;
-        for (int t = L - 1; t >= 0; t--) { nxt[p] = buf[t]; prv[buf[t]] = p; p = buf[t]; }
+        for (int t = L - 1; t >= 0; t--) {
+            nxt[p] = buf[t]; prv[buf[t]] = p;
+            /* the reversal swaps upstream and downstream: bnx must follow,
+               otherwise relocate's informed insertion side reads the edge
+               from before (inc[] is invariant: sum of the two edges) */
+            if (w->need_bnx && p >= 1 && p <= n) w->bnx[p] = dxy(w, p, buf[t]);
+            p = buf[t];
+        }
         nxt[p] = sb; prv[sb] = p;
+        if (w->need_bnx && p >= 1 && p <= n) w->bnx[p] = dxy(w, p, sb);
         {
             inc_upd(in, w, S, a);  inc_upd(in, w, S, sa);
             inc_upd(in, w, S, b);  inc_upd(in, w, S, sb);
@@ -1363,7 +1596,9 @@ static inline double sa_draw(const Inst *in, WS *w, const Opts *o, Sol *S,
     if (z < w->th1) return mv_relocate(in, w, S, K, T, rng, probe);
     if (z < w->th2) return mv_swap    (in, w, S, K, T, rng, probe);
     if (z < w->th3) return mv_2opt    (in, w, S, K, T, rng, probe);
-    return                 mv_oropt   (in, w, S, K, T, rng, probe);
+    if (z < w->th4) return mv_oropt   (in, w, S, K, T, rng, probe);
+    if (z < w->th5) return mv_swapstar(in, w, S, K, T, rng, probe);
+    return                 mv_open    (in, w, S, K, T, rng, probe);
 }
 
 /* ------------------------------------------- calibration of the initial T
@@ -1388,74 +1623,196 @@ static double calibrate_T0(const Inst *in, WS *w, const Opts *o, Sol *S,
     return -(sum / ns) / log(o->sa_chi0);
 }
 
-/* ------------------------------------------------------- the annealing loop */
+/* =========================================================================
+ *  Chained annealing: every start is an independent chain (solution,
+ *  incremental buffers, PRNG, temperature). Two chains of the same instance
+ *  can be advanced ALTERNATELY in the same loop (--pair 1): the memory
+ *  latencies of one overlap with the computation of the other, without
+ *  changing either trajectory by a single bit -- a chain consumes its own
+ *  random stream and touches only its own arrays; only the transient scratch
+ *  buffers (of the operators, of Split) are shared, and each step completes
+ *  before the other chain plays.
+ * ========================================================================= */
 
-static double anneal(const Inst *in, WS *w, const Opts *o, Sol *S,
-                     double cur, uint64_t seed)
+typedef struct {
+    Sol     sol;
+    double *inc, *bnx, *bad;                 /* private incremental state  */
+    int    *b_nxt, *b_prv, *b_rid;           /* best of the chain          */
+    double *b_load;
+    Rng     rng;
+    double  cur, best, T, alpha, T0;
+    int     bR, alive, frozen;
+    long    acc, spent, cp;                  /* cp: step of the checkpoint */
+    double  cp_cost;
+    double  c0;                              /* cost after C&W (+ split cw) */
+    int     visited;
+} Chain;
+
+static inline void chain_bind(WS *w, Chain *c)
 {
-    const int n = S->n, R = S->R, steps = o->sa_steps;
-    if (steps <= 0) return cur;
+    w->inc = c->inc; w->bnx = c->bnx; w->bad = c->bad;
+}
 
+/* Cumulative operator fraction -> uint32 threshold. The clamp is not
+   cosmetic: a cumulative fraction lands on exactly 1.0 as soon as every
+   following weight is zero (e.g. --ops 1,0,0,0), and (uint32_t)(1.0 * 2^32)
+   is undefined behaviour -- the value the compiler produces there depends on
+   the surrounding code. */
+static inline uint32_t op_thr(double c)
+{
+    if (c >= 1.0) return 0xFFFFFFFFu;
+    if (c <= 0.0) return 0u;
+    return (uint32_t)(c * 4294967296.0);
+}
+
+/* Configuration shared by every chain of one instance: operators, kNN,
+   bounds. Depends on the instance and the options, not on the solution
+   (except eps0 in Fenwick mode without kNN, which is never interleaved).
+   Returns K. */
+static int sa_config(const Inst *in, WS *w, const Opts *o, int n, int R,
+                     double cur0)
+{
     int K = o->sa_knn; if (K > n - 1) K = n - 1; if (K < 0) K = 0;
     w->pick_t = (K > 0) ? o->pick_t : 1;   /* the regret needs the kNN lists */
     w->crit = o->pick_crit; w->or_max = o->or_max;
-    {   double wt = o->w_rel + o->w_swap + o->w_2opt + o->w_or;
-        double c1 = o->w_rel / wt, c2 = c1 + o->w_swap / wt, c3 = c2 + o->w_2opt / wt;
-        w->th1 = (uint32_t)(c1 * 4294967296.0);
-        w->th2 = (uint32_t)(c2 * 4294967296.0);
-        w->th3 = (uint32_t)(c3 * 4294967296.0);
-        if (o->w_or <= 0.0) w->th3 = 0xFFFFFFFFu;
+    {   double wt = o->w_rel + o->w_swap + o->w_2opt + o->w_or + o->w_sstar
+                  + o->w_open;
+        double c1 = o->w_rel / wt, c2 = c1 + o->w_swap / wt;
+        double c3 = c2 + o->w_2opt / wt, c4 = c3 + o->w_or / wt;
+        double c5 = c4 + o->w_sstar / wt;
+        w->th1 = op_thr(c1); w->th2 = op_thr(c2); w->th3 = op_thr(c3);
+        w->th4 = op_thr(c4); w->th5 = op_thr(c5);
+        if (o->w_open  <= 0.0) w->th5 = 0xFFFFFFFFu;
+        if (o->w_sstar <= 0.0 && o->w_open <= 0.0) w->th4 = 0xFFFFFFFFu;
+        if (o->w_or <= 0.0 && o->w_sstar <= 0.0 && o->w_open <= 0.0)
+            w->th3 = 0xFFFFFFFFu;
     }
-    xy_build(in, w);
+    if (!w->xy_ok) { xy_build(in, w); w->xy_ok = 1; }
     if (K > 0) {
-        knn_need(in, w, K); lb_build(in, w, K);
-        double m = 0.0;
-        for (int u = 1; u <= n; u++) m += w->lb[u];
-        w->eps0 = o->pick_eps * m / (2.0 * n);   /* ~ nearest-neighbour distance */
-    } else if (w->crit == 0 || w->crit == 2) w->pick_t = 1;  /* these need the kNN */
-    else w->eps0 = o->pick_eps * cur / (double)(n + R);
-    inc_build(in, w, S);
+        knn_need(in, w, K);                      /* may invalidate lb_k */
+        if (w->lb_k != K) {
+            lb_build(in, w, K);
+            double m = 0.0;
+            for (int u = 1; u <= n; u++) m += w->lb[u];
+            w->eps0 = o->pick_eps * m / (2.0 * n); /* ~ nearest-neighbour dist */
+            w->lb_k = K;
+        }
+    } else if (w->crit == 0 || w->crit == 2) w->pick_t = 1;  /* need the kNN */
+    else w->eps0 = o->pick_eps * cur0 / (double)(n + R);
+    w->pick2 = (K > 0) ? o->pick2 : 1;            /* the v side needs the kNN */
+    w->vrank = o->vrank;
+    w->reloc_side = o->reloc_side;
+    w->need_bnx = (o->reloc_side != 0);
+    return K;
+}
 
-    Rng rng; rng_seed(&rng, seed);
+/* Initialisation of a chain: incremental state, temperature calibration,
+   initial snapshot. */
+static void chain_init(const Inst *in, WS *w, const Opts *o, Chain *c,
+                       int K, long budget, uint64_t seed)
+{
+    const int n = c->sol.n;
     const size_t zi = (size_t)(2 * n + 4) * sizeof(int);
     const size_t zd = (size_t)(n + 2) * sizeof(double);
-    int bR = R;
+    chain_bind(w, c);
+    inc_build(in, w, &c->sol);
+    rng_seed(&c->rng, seed);
+    c->best = c->cur; c->bR = c->sol.R;
+    c->acc = 0; c->spent = 0; c->alive = 1; c->frozen = 0;
+    c->cp = (long)(o->race_at * (double)budget); c->cp_cost = 0.0;
 
-    /* temperatures: calibrated by sampling, unless --t0 is forced */
     double T0 = o->sa_t0, Tend = o->sa_tend;
     if (T0 <= 0.0) {                                   /* automatic mode */
-        T0 = calibrate_T0(in, w, o, S, K, &rng);
-        if (T0 <= 0.0) return cur;                     /* frozen solution   */
+        T0 = calibrate_T0(in, w, o, &c->sol, K, &c->rng);
+        if (T0 <= 0.0) { c->alive = 0; c->frozen = 1; c->T0 = 0.0; return; }
         Tend = T0 * pow(10.0, -o->sa_decades);
     }
-    double T = T0;
-    const double alpha = (steps > 1) ? pow(Tend / T0, 1.0 / (steps - 1)) : 1.0;
-    double best = cur;
-    memcpy(w->b_nxt, S->nxt, zi); memcpy(w->b_prv, S->prv, zi);
-    memcpy(w->b_rid, S->rid, zi); memcpy(w->b_load, S->load, zd);
+    c->T = c->T0 = T0;
+    c->alpha = (budget > 1) ? pow(Tend / T0, 1.0 / (double)(budget - 1)) : 1.0;
+    memcpy(c->b_nxt, c->sol.nxt, zi); memcpy(c->b_prv, c->sol.prv, zi);
+    memcpy(c->b_rid, c->sol.rid, zi); memcpy(c->b_load, c->sol.load, zd);
+}
 
-    for (int it = 0; it < steps; it++) {
-        cur += sa_draw(in, w, o, S, K, T, &rng, 0);
+/* One step of a chain (operator, periodic Split, best-so-far snapshot,
+   temperature, racing checkpoint). Assumes the chain is bound. */
+static inline void chain_step(const Inst *in, WS *w, const Opts *o, Chain *c,
+                              int K, long it, double race_ref,
+                              size_t zi, size_t zd, int *nalive)
+{
+    c->cur += sa_draw(in, w, o, &c->sol, K, c->T, &c->rng, 0);
 
-        if (o->split_every > 0 && (it + 1) % o->split_every == 0) {
-            double p = split_apply(in, w, o, S, cur);
-            if (p >= 0.0) { w->gsplit += cur - p; cur = p;
-                            inc_build(in, w, S); }
-        }
-        if (cur < best - 1e-12) {
-            best = cur;
-            bR = S->R;
-            memcpy(w->b_nxt, S->nxt, zi); memcpy(w->b_prv, S->prv, zi);
-            memcpy(w->b_rid, S->rid, zi); memcpy(w->b_load, S->load, zd);
-        }
-        T *= alpha;
+    if (o->split_every > 0 && (it + 1) % o->split_every == 0) {
+        double p = split_apply(in, w, o, &c->sol, c->cur);
+        if (p >= 0.0) { w->gsplit += c->cur - p; c->cur = p;
+                        inc_build(in, w, &c->sol); }
     }
-    memcpy(S->nxt, w->b_nxt, zi); memcpy(S->prv, w->b_prv, zi);
-    memcpy(S->rid, w->b_rid, zi); memcpy(S->load, w->b_load, zd);
-    S->R = bR;
-    inc_build(in, w, S);
-    w->t0_used = T0;
-    return best;
+    if (c->cur < c->best - 1e-12) {
+        c->best = c->cur;
+        c->bR = c->sol.R;
+        memcpy(c->b_nxt, c->sol.nxt, zi); memcpy(c->b_prv, c->sol.prv, zi);
+        memcpy(c->b_rid, c->sol.rid, zi); memcpy(c->b_load, c->sol.load, zd);
+    }
+    c->T *= c->alpha;
+    if (it == c->cp) {
+        c->cp_cost = c->best;
+        if (race_ref > 0.0 && c->best > race_ref * (1.0 + o->race)) {
+            c->alive = 0; c->spent = it + 1; (*nalive)--;   /* race lost */
+        }
+    }
+}
+
+/* Advances nch chains alternately over `budget` steps. race_ref < 0: no
+   active checkpoint. A chain killed at the checkpoint keeps the best it
+   reached; its remaining steps are returned to the caller through spent. */
+static void anneal_chains(const Inst *in, WS *w, const Opts *o,
+                          Chain **ch, int nch, int K, long budget,
+                          double race_ref)
+{
+    const int n = ch[0]->sol.n;
+    const size_t zi = (size_t)(2 * n + 4) * sizeof(int);
+    const size_t zd = (size_t)(n + 2) * sizeof(double);
+    int nalive = 0;
+    for (int c = 0; c < nch; c++) nalive += ch[c]->alive;
+
+    if (nch == 1) {                              /* binding hoisted out */
+        Chain *c = ch[0];
+        if (!c->alive) return;
+        chain_bind(w, c);
+        w->acc = c->acc;
+        for (long it = 0; it < budget && c->alive; it++)
+            chain_step(in, w, o, c, K, it, race_ref, zi, zd, &nalive);
+        c->acc = w->acc;
+        if (c->alive) c->spent = budget;
+        return;
+    }
+    for (long it = 0; it < budget && nalive; it++) {
+        for (int ci = 0; ci < nch; ci++) {
+            Chain *c = ch[ci];
+            if (!c->alive) continue;
+            chain_bind(w, c);
+            w->acc = c->acc;
+            chain_step(in, w, o, c, K, it, race_ref, zi, zd, &nalive);
+            c->acc = w->acc;
+        }
+    }
+    for (int ci = 0; ci < nch; ci++)
+        if (ch[ci]->alive) ch[ci]->spent = budget;
+}
+
+/* Restores the best reached by the chain into its solution. */
+static double chain_finish(const Inst *in, WS *w, Chain *c)
+{
+    const int n = c->sol.n;
+    const size_t zi = (size_t)(2 * n + 4) * sizeof(int);
+    const size_t zd = (size_t)(n + 2) * sizeof(double);
+    chain_bind(w, c);
+    if (!c->frozen) {
+        memcpy(c->sol.nxt, c->b_nxt, zi); memcpy(c->sol.prv, c->b_prv, zi);
+        memcpy(c->sol.rid, c->b_rid, zi); memcpy(c->sol.load, c->b_load, zd);
+        c->sol.R = c->bR;
+        inc_build(in, w, &c->sol);
+    }
+    return c->best;
 }
 
 /* =========================================================================
@@ -1470,43 +1827,15 @@ typedef struct {
     double time_ms;
 } Result;
 
-static double solve_cw(const Inst *in, WS *w, const Opts *o,
-                       Result *res, int **sol_out, uint64_t seed)
+/* Builds the starting solution of restart rs into *sol: savings (possibly
+   randomised) or a random permutation, merging, routes, and the "cw" Split if
+   it is active. Returns the starting cost. Deterministic for
+   (instance, rs, seed). */
+static double build_cw_start(const Inst *in, WS *w, const Opts *o, Sol *sol,
+                             int rs, uint64_t seed, int exact, int K,
+                             const double *d0, int *pvisited)
 {
-    const int n = in->n;
-    if ((unsigned)n > MAXN) die("n=%d exceeds %u", n, MAXN);
-    w->knn_k = 0;                                /* kNN lists must be rebuilt */
-
-    /* --- size of the savings list --- */
-    int K = o->knn;
-    int exact;
-    if (K < 0)       { exact = 1; }                            /* --exact */
-    else if (K == 0) { exact = (n <= 1500); K = 32; }          /* auto    */
-    else             { exact = 0; }
-    if (exact) K = n - 1;
-    if (K > n - 1) K = n - 1;
-    if (K < 1) K = 1;
-
-    size_t nsav = exact ? ((size_t)n * (size_t)(n - 1)) / 2 : (size_t)n * (size_t)K;
-    if (o->init_random) nsav = 1;         /* no savings list is ever built */
-    ws_ensure(w, n, K, nsav ? nsav : 1);
-
-    double *d0 = w->d0;
-    for (int i = 0; i <= n; i++) d0[i] = dist(in, 0, i);
-
-    Sol sol;
-    sol.n = n;
-    sol.nxt = w->s_nxt; sol.prv = w->s_prv; sol.rid = w->s_rid; sol.load = w->s_load;
-
-    const size_t zi = (size_t)(2 * n + 4) * sizeof(int);
-    const size_t zd = (size_t)(n + 2) * sizeof(double);
-    double bestc = 1e300, bestc0 = 0, sum0 = 0, sum1 = 0, worst1 = -1e300, gsplit_tot = 0;
-    int bestR = 0, best_visited = 0;
-    Result rbest; memset(&rbest, 0, sizeof rbest);
-
-    /* ======================= multiple restarts ======================= */
-    for (int rs = 0; rs < o->restarts; rs++) {
-
+    const int n = sol->n;
     Rng rcw; rng_seed(&rcw, seed * 0xD1342543DE82EF95ULL + (uint64_t)rs * 0x9E3779B97F4A7C15ULL);
     const int rnd = (rs > 0) ? o->cw_rand : 0;      /* restart 0 = deterministic C&W */
     /* multiplicative perturbation of the savings: changes the order in which
@@ -1631,44 +1960,170 @@ static double solve_cw(const Inst *in, WS *w, const Opts *o,
     rstart[R] = nf;
 
     /* --- linked solution, cost before annealing --- */
-    sol.R = R;
+    sol->R = R;
     for (int r = 0; r < R; r++)
-        route_set(&sol, in, r, flat + rstart[r], rstart[r + 1] - rstart[r]);
+        route_set(sol, in, r, flat + rstart[r], rstart[r + 1] - rstart[r]);
 
-    w->gsplit = 0.0;
-    double cost0 = sol_cost(in, &sol);
+    double cost0 = sol_cost(in, sol);
     if (o->split & 1) {                          /* Split right after C&W */
-        double p = split_apply(in, w, o, &sol, cost0);
+        double p = split_apply(in, w, o, sol, cost0);
         if (p >= 0.0) { w->gsplit += cost0 - p; cost0 = p; }
     }
-    double cost = cost0;
+    *pvisited = visited;
+    return cost0;
+}
 
-    /* --- simulated annealing --- */
-    if (o->sa_steps > 0) {
-        w->acc = 0;
-        double tracked = anneal(in, w, o, &sol, cost0,
-                                (seed ^ 0x5DEECE66DULL) + (uint64_t)rs * 0xBF58476D1CE4E5B9ULL);
-        cost = sol_cost(in, &sol);
-        res->drift = fabs(cost - tracked);
-        res->acc = (double)w->acc / o->sa_steps;
-        res->t0  = w->t0_used;
-    } else {
-        res->drift = 0.0; res->acc = 0.0; res->t0 = 0.0;
-    }
-    if (o->split & 2) {                          /* final Split */
-        double p = split_apply(in, w, o, &sol, cost);
-        if (p >= 0.0) { w->gsplit += cost - p; cost = sol_cost(in, &sol); }
+static double solve_cw(const Inst *in, WS *w, const Opts *o,
+                       Result *res, int **sol_out, uint64_t seed)
+{
+    const int n = in->n;
+    if ((unsigned)n > MAXN) die("n=%d exceeds %u", n, MAXN);
+    w->knn_k = 0;                                /* kNN lists must be rebuilt */
+    w->xy_ok = 0; w->lb_k = -1;                  /* per-instance caches */
+
+    /* --- size of the savings list --- */
+    int K = o->knn;
+    int exact;
+    if (K < 0)       { exact = 1; }                            /* --exact */
+    else if (K == 0) { exact = (n <= 1500); K = 32; }          /* auto    */
+    else             { exact = 0; }
+    if (exact) K = n - 1;
+    if (K > n - 1) K = n - 1;
+    if (K < 1) K = 1;
+
+    size_t nsav = exact ? ((size_t)n * (size_t)(n - 1)) / 2 : (size_t)n * (size_t)K;
+    if (o->init_random) nsav = 1;         /* no savings list is ever built */
+    ws_ensure(w, n, K, nsav ? nsav : 1);
+
+    double *d0 = w->d0;
+    for (int i = 0; i <= n; i++) d0[i] = dist(in, 0, i);
+
+    Sol sol;
+    sol.n = n;
+    sol.nxt = w->s_nxt; sol.prv = w->s_prv; sol.rid = w->s_rid; sol.load = w->s_load;
+
+    const size_t zi = (size_t)(2 * n + 4) * sizeof(int);
+    const size_t zd = (size_t)(n + 2) * sizeof(double);
+    double bestc = 1e300, bestc0 = 0, sum0 = 0, sum1 = 0, worst1 = -1e300, gsplit_tot = 0;
+    int bestR = 0, best_visited = 0;
+    Result rbest; memset(&rbest, 0, sizeof rbest);
+
+    /* ======================= multiple restarts ======================= */
+    Chain cA, cB;
+    memset(&cA, 0, sizeof cA); memset(&cB, 0, sizeof cB);
+    cA.sol = sol;
+    cB.sol.n = n;
+    cB.sol.nxt = w->s2_nxt; cB.sol.prv = w->s2_prv;
+    cB.sol.rid = w->s2_rid; cB.sol.load = w->s2_load;
+    cA.b_nxt = w->b_nxt;  cA.b_prv = w->b_prv;
+    cA.b_rid = w->b_rid;  cA.b_load = w->b_load;
+    cB.b_nxt = w->b2_nxt; cB.b_prv = w->b2_prv;
+    cB.b_rid = w->b2_rid; cB.b_load = w->b2_load;
+    cA.inc = w->inc_o; cA.bnx = w->bnx_o; cA.bad = w->bad_o;
+    cB.inc = w->inc2;  cB.bnx = w->bnx2;  cB.bad = w->bad2;
+
+    /* Interleaving requires private states: Fenwick mode (--pick 0) shares its
+       tree, so it stays sequential. --pair -1 (auto) turns it on from n >= 400,
+       where the state of one chain spills out of L1/L2. */
+    const int pair_on = (o->pair < 0) ? (n >= 400) : o->pair;
+    const int width = (pair_on && o->pick_t != 0 && o->sa_steps > 0) ? 2 : 1;
+
+    long   rem   = (long)o->restarts * (long)(o->sa_steps > 0 ? o->sa_steps : 0);
+    int    remch = o->restarts;
+    double race_ref = -1.0;
+    int    Ksa = 0, configured = 0;
+
+    for (int rs0 = 0; rs0 < o->restarts; ) {
+        int nch = o->restarts - rs0; if (nch > width) nch = width;
+        Chain *ch[2] = { &cA, &cB };
+        long budget = o->sa_steps;
+        if (o->race > 0.0 && o->sa_steps > 0) {
+            budget = rem / remch;
+            if (budget < 1) budget = 1;
+        }
+
+        w->gsplit = 0.0;
+        for (int c = 0; c < nch; c++) {
+            int rs = rs0 + c;
+            ch[c]->c0  = build_cw_start(in, w, o, &ch[c]->sol, rs, seed,
+                                        exact, K, d0, &ch[c]->visited);
+            ch[c]->cur = ch[c]->c0;
+        }
+        if (o->sa_steps > 0) {
+            Ksa = sa_config(in, w, o, n, cA.sol.R, cA.cur);
+            configured = 1;
+            for (int c = 0; c < nch; c++)
+                chain_init(in, w, o, ch[c], Ksa, budget,
+                           (seed ^ 0x5DEECE66DULL)
+                           + (uint64_t)(rs0 + c) * 0xBF58476D1CE4E5B9ULL);
+            anneal_chains(in, w, o, ch, nch, Ksa, budget, race_ref);
+        }
+
+        for (int c = 0; c < nch; c++) {
+            Chain *cc = ch[c];
+            double cost0 = cc->c0, cost;
+            if (o->sa_steps > 0) {
+                double tracked = chain_finish(in, w, cc);
+                cost = sol_cost(in, &cc->sol);
+                res->drift = fabs(cost - tracked);
+                res->acc = cc->spent ? (double)cc->acc / o->sa_steps : 0.0;
+                res->t0  = cc->T0;
+            } else {
+                cost = cost0;
+                res->drift = 0.0; res->acc = 0.0; res->t0 = 0.0;
+            }
+            if (o->split & 2) {                      /* final Split */
+                double p = split_apply(in, w, o, &cc->sol, cost);
+                if (p >= 0.0) { w->gsplit += cost - p; cost = sol_cost(in, &cc->sol); }
+            }
+            sum0 += cost0; sum1 += cost;
+            if (cost > worst1) worst1 = cost;
+            if (cost < bestc) {                      /* best restart so far */
+                bestc = cost; bestc0 = cost0; bestR = cc->sol.R;
+                best_visited = cc->visited;
+                rbest = *res;
+                memcpy(w->r_nxt, cc->sol.nxt, zi); memcpy(w->r_prv, cc->sol.prv, zi);
+                memcpy(w->r_rid, cc->sol.rid, zi); memcpy(w->r_load, cc->sol.load, zd);
+                if (o->race > 0.0 && o->sa_steps > 0 && cc->spent > cc->cp)
+                    race_ref = cc->cp_cost;
+            }
+            rem -= cc->spent;
+        }
+        gsplit_tot += w->gsplit;
+        remch -= nch;
+        rs0 += nch;
     }
 
-    sum0 += cost0; sum1 += cost; gsplit_tot += w->gsplit;
-    if (cost > worst1) worst1 = cost;
-    if (cost < bestc) {                          /* best restart so far */
-        bestc = cost; bestc0 = cost0; bestR = sol.R; best_visited = visited;
-        rbest = *res;
-        memcpy(w->r_nxt, sol.nxt, zi); memcpy(w->r_prv, sol.prv, zi);
-        memcpy(w->r_rid, sol.rid, zi); memcpy(w->r_load, sol.load, zd);
+    /* steps handed back by the abandoned starts: polish the best one */
+    if (o->race > 0.0 && o->sa_steps > 0 && configured
+        && rem >= o->sa_steps / 10 + 1) {
+        w->gsplit = 0.0;
+        memcpy(cA.sol.nxt, w->r_nxt, zi); memcpy(cA.sol.prv, w->r_prv, zi);
+        memcpy(cA.sol.rid, w->r_rid, zi); memcpy(cA.sol.load, w->r_load, zd);
+        cA.sol.R = bestR;
+        cA.cur = bestc; cA.c0 = bestc; cA.visited = best_visited;
+        Chain *ch1[1] = { &cA };
+        chain_init(in, w, o, &cA, Ksa, rem,
+                   (seed ^ 0x5DEECE66DULL)
+                   + (uint64_t)o->restarts * 0xBF58476D1CE4E5B9ULL);
+        anneal_chains(in, w, o, ch1, 1, Ksa, rem, -1.0);
+        double tracked = chain_finish(in, w, &cA);
+        double cost = sol_cost(in, &cA.sol);
+        if (o->split & 2) {
+            double p = split_apply(in, w, o, &cA.sol, cost);
+            if (p >= 0.0) { w->gsplit += cost - p; cost = sol_cost(in, &cA.sol); }
+        }
+        if (cost < bestc) {
+            bestc = cost; bestR = cA.sol.R;
+            res->drift = fabs(cost - tracked);
+            res->acc = cA.spent ? (double)cA.acc / o->sa_steps : 0.0;
+            res->t0 = cA.T0;
+            rbest = *res;
+            memcpy(w->r_nxt, cA.sol.nxt, zi); memcpy(w->r_prv, cA.sol.prv, zi);
+            memcpy(w->r_rid, cA.sol.rid, zi); memcpy(w->r_load, cA.sol.load, zd);
+        }
+        gsplit_tot += w->gsplit;
     }
-    }   /* ==================== end of multiple restarts ==================== */
 
     memcpy(sol.nxt, w->r_nxt, zi); memcpy(sol.prv, w->r_prv, zi);
     memcpy(sol.rid, w->r_rid, zi); memcpy(sol.load, w->r_load, zd);
@@ -1861,9 +2316,17 @@ static void usage(void)
 "Simulated annealing (on by default, applied after Clarke & Wright):\n"
 "  --sa-steps N       number of steps              (default 1000)\n"
 "  --no-sa            disable annealing\n"
-"  --ops r,s,t,o      relative weights of the relocate, swap, 2-opt and\n"
-"                     or-opt operators  (default 1,1,1,0: or-opt disabled,\n"
-"                     see the README; e.g. --ops 1,0,0,0 for relocate only)\n"
+"  --ops r,s,t,o[,x,e]  relative weights of the relocate, swap, 2-opt,\n"
+"                     or-opt, swap* and route-opening operators\n"
+"                     (default 1,1,1,0,0,0: or-opt, swap* and opening are\n"
+"                     disabled, see the README; --ops 1,0,0,0 = relocate only)\n"
+"                     swap* (Vidal 2022) exchanges two customers of different\n"
+"                     routes, each reinserted at its BEST position in the\n"
+"                     other's route: O(L1+L2) per draw, exact delta. It does\n"
+"                     not replace swap, both can be drawn together.\n"
+"                     opening isolates one customer in an empty route: almost\n"
+"                     always worsening, but it is the only move that raises\n"
+"                     the number of active routes (try 0.05).\n"
 "  --or-max L         maximum or-opt segment length              (default 3)\n"
 "  --t-accept X       target initial acceptance rate         (default 0.001)\n"
 "                     T0 is calibrated by sampling the worsening moves\n"
@@ -1885,12 +2348,34 @@ static void usage(void)
 "  --pick-eps E       with --pick 0: weight = regret + E * (mean distance to\n"
 "                     the nearest neighbour); small E = more peaked sampling\n"
 "                     (default 0.3)\n"
+"  --vrank T          bias on the second vertex: since the kNN lists are\n"
+"                     sorted, the index drawn is the minimum of T uniform\n"
+"                     draws, which favours the nearer neighbours at no memory\n"
+"                     cost. 1 = uniform (default). Pairs well with a larger\n"
+"                     --sa-knn (e.g. --sa-knn 30 --vrank 2)\n"
+"  --pick2 T          tournament of size T on the second vertex: T candidates\n"
+"                     among the kNN of u, keep the one of largest regret\n"
+"                     (default 1 = no tournament)\n"
+"  --reloc-side S     relocate insertion side: coin = coin flip (default),\n"
+"                     long = break the longer of the two edges adjacent to v\n"
 "  --check            report the incremental-cost drift (verification)\n"
 "\n"
 "Multiple restarts:\n"
 "  --restarts R       R initial C&W solutions per instance; annealing is run\n"
 "                     from each of them and the best one is kept\n"
 "                     (restart 0 is always the deterministic C&W)\n"
+"  --race M           racing between starts: at --race-at of its budget, a\n"
+"                     start worse than the best finished start at the same\n"
+"                     point of its trajectory by a relative margin M is\n"
+"                     abandoned; its steps are handed to the following starts\n"
+"                     and the remainder polishes the best one. off = disabled\n"
+"                     (default off; try 0.002)\n"
+"  --race-at F        fraction of the budget at which the checkpoint sits\n"
+"                     (default 0.25)\n"
+"  --pair P           interleave two starts in the same loop to overlap memory\n"
+"                     latency with computation: 0 = off (default), 1 = on,\n"
+"                     -1 = auto (on from n >= 400). Pure engineering: the\n"
+"                     trajectories are unchanged. Ignored with --pick 0.\n"
 "  --cw-rand MODE     off | perturb | param | both       (default perturb)\n"
 "                     perturb: each saving is multiplied by 1+alpha*U(-1,1),\n"
 "                              which reshuffles the order in which pairs of\n"
@@ -1937,6 +2422,11 @@ int main(int argc, char **argv)
     o.sa_steps = 1000; o.sa_t0 = -1.0; o.sa_tend = -1.0; o.sa_chi0 = 0.001; o.sa_decades = 2.0; o.split = 0; o.split_every = 0; o.split_tour = 2;
     o.restarts = 1; o.cw_rand = 1; o.cw_alpha = 0.03; o.pick_t = 2; o.pick_eps = 0.3; o.pick_crit = 0; o.sa_knn = 20;
     o.w_rel = 1.0; o.w_swap = 1.0; o.w_2opt = 1.0; o.w_or = 0.0; o.or_max = 3;
+    /* new knobs, all neutral by default: with none of them set the solver
+       reproduces the previous behaviour exactly */
+    o.w_sstar = 0.0; o.w_open = 0.0;
+    o.pick2 = 1; o.vrank = 1; o.reloc_side = 0; o.pair = 0;
+    o.race = 0.0; o.race_at = 0.25;
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -1970,10 +2460,10 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--ops")) {
             char buf[128], *c; snprintf(buf, sizeof buf, "%s", NEXT());
             for (c = buf; *c; c++) if (*c == ':' || *c == '/') *c = ',';
-            o.w_rel = o.w_swap = o.w_2opt = o.w_or = 0.0;
-            if (sscanf(buf, "%lf,%lf,%lf,%lf", &o.w_rel, &o.w_swap,
-                       &o.w_2opt, &o.w_or) < 1)
-                die("--ops: expected format r,s,t[,o] (e.g. 1,1,1,1)");
+            o.w_rel = o.w_swap = o.w_2opt = o.w_or = o.w_sstar = o.w_open = 0.0;
+            if (sscanf(buf, "%lf,%lf,%lf,%lf,%lf,%lf", &o.w_rel, &o.w_swap,
+                       &o.w_2opt, &o.w_or, &o.w_sstar, &o.w_open) < 1)
+                die("--ops: expected format r,s,t[,o[,x[,e]]] (e.g. 1,1,1,0,1,0.05)");
         }
         else if (!strcmp(a, "--split")) {
             const char *v = NEXT();
@@ -1993,6 +2483,20 @@ int main(int argc, char **argv)
         }
         else if (!strcmp(a, "--restarts"))     o.restarts = atoi(NEXT());
         else if (!strcmp(a, "--pick"))         o.pick_t = atoi(NEXT());
+        else if (!strcmp(a, "--pick2"))        o.pick2 = atoi(NEXT());
+        else if (!strcmp(a, "--vrank"))        o.vrank = atoi(NEXT());
+        else if (!strcmp(a, "--pair"))         o.pair = atoi(NEXT());
+        else if (!strcmp(a, "--reloc-side")) {
+            const char *v = NEXT();
+            if      (!strcmp(v, "coin")) o.reloc_side = 0;
+            else if (!strcmp(v, "long")) o.reloc_side = 1;
+            else die("--reloc-side: coin | long");
+        }
+        else if (!strcmp(a, "--race")) {
+            const char *v = NEXT();
+            o.race = strcmp(v, "off") ? atof(v) : 0.0;
+        }
+        else if (!strcmp(a, "--race-at"))      o.race_at = atof(NEXT());
         else if (!strcmp(a, "--or-max"))       o.or_max = atoi(NEXT());
         else if (!strcmp(a, "--pick-eps"))     o.pick_eps = atof(NEXT());
         else if (!strcmp(a, "--pick-crit")) {
@@ -2040,7 +2544,13 @@ int main(int argc, char **argv)
     if (o.pick_eps < 0) die("--pick-eps: must be positive");
     if (o.cw_alpha < 0 || o.cw_alpha >= 1) die("--cw-alpha: 0 <= alpha < 1 is required");
     if (o.or_max < 2 || o.or_max > 8) die("--or-max: between 2 and 8");
-    if (o.sa_steps > 0 && o.w_rel + o.w_swap + o.w_2opt + o.w_or <= 0)
+    if (o.pick2 < 1 || o.pick2 > 16) die("--pick2: between 1 and 16");
+    if (o.vrank < 1 || o.vrank > 8) die("--vrank: between 1 and 8");
+    if (o.pair < -1 || o.pair > 1) die("--pair: 0, 1 or -1 (auto)");
+    if (o.race < 0) die("--race: positive relative margin, or off");
+    if (o.race_at <= 0 || o.race_at >= 1) die("--race-at: 0 < F < 1 is required");
+    if (o.sa_steps > 0 && o.w_rel + o.w_swap + o.w_2opt + o.w_or
+                        + o.w_sstar + o.w_open <= 0)
         die("--ops: at least one weight must be strictly positive");
 
     /* --- loading --- */
@@ -2098,7 +2608,8 @@ int main(int argc, char **argv)
             printf("%s\n", o.do2opt ? ", + intra-route 2-opt" : "");
         }
         if (o.sa_steps > 0) {
-            double wt = o.w_rel + o.w_swap + o.w_2opt + o.w_or;
+            double wt = o.w_rel + o.w_swap + o.w_2opt + o.w_or
+                      + o.w_sstar + o.w_open;
             if (o.sa_t0 > 0)
                 printf("# annealing  : %d steps, T from %g to %g (geometric), K=%d\n",
                        o.sa_steps, o.sa_t0, o.sa_tend, o.sa_knn);
@@ -2107,12 +2618,17 @@ int main(int argc, char **argv)
                        "acceptance %.3g %%), %g decades, K=%d\n",
                        o.sa_steps, 100 * o.sa_chi0, o.sa_decades, o.sa_knn);
             printf("# operators  : relocate %.0f%%, swap %.0f%%, 2-opt %.0f%%, "
-                   "or-opt %.0f%% (segments <= %d)\n", 100 * o.w_rel / wt,
+                   "or-opt %.0f%% (segments <= %d), swap* %.0f%%, opening "
+                   "%.1f%%\n", 100 * o.w_rel / wt,
                    100 * o.w_swap / wt, 100 * o.w_2opt / wt, 100 * o.w_or / wt,
-                   o.or_max);
-            printf("# selection  : %s\n", o.pick_t == 1 ? "uniform" :
+                   o.or_max, 100 * o.w_sstar / wt, 100 * o.w_open / wt);
+            printf("# selection  : %s", o.pick_t == 1 ? "uniform" :
                    (o.pick_t == 0 ? "proportional to regret (Fenwick)"
                                   : "tournament on regret"));
+            if (o.vrank > 1) printf(", v: rank bias %d", o.vrank);
+            if (o.pick2 > 1) printf(", v: tournament %d", o.pick2);
+            if (o.reloc_side) printf(", relocate side: longest edge");
+            printf("\n");
             if (o.pick_t != 1)
                 { static const char *cn[4] = { "gap to the lower bound",
                         "removal gain", "normalised removal gain",
@@ -2133,6 +2649,11 @@ int main(int argc, char **argv)
                                              : cn[o.cw_rand]);
             if (!o.init_random && (o.cw_rand & 1)) printf(" (alpha=%g)", o.cw_alpha);
             printf("\n");
+            if (o.race > 0.0)
+                printf("# racing     : margin %g at %.0f%% of the budget\n",
+                       o.race, 100 * o.race_at);
+            if (o.pair)
+                printf("# interleave : %s\n", o.pair < 0 ? "auto (n >= 400)" : "on");
         }
         printf("# threads    : %d\n", nthreads);
         fflush(stdout);

@@ -39,9 +39,9 @@ def rnd_opts(r):
     o = []
     steps = r.choice([0, 1, 2, 17, 300] + ([] if SLOW else [3000, 20000]))
     o += ["--sa-steps", str(steps)]
-    w = [r.choice([0, 0, 1, 1, 2, 5]) for _ in range(4)]
+    w = [r.choice([0, 0, 1, 1, 2, 5]) for _ in range(6)]
     if sum(w) == 0:
-        w[r.randrange(4)] = 1
+        w[r.randrange(6)] = 1
     o += ["--ops", ",".join(map(str, w))]
     o += ["--or-max", str(r.randint(2, 8))]
     o += ["--pick", str(r.choice([0, 1, 2, 3, 5]))]
@@ -49,6 +49,12 @@ def rnd_opts(r):
     o += ["--pick-eps", str(r.choice([0.0, 0.05, 0.3, 2.0]))]
     o += ["--sa-knn", str(r.choice([0, 1, 2, 5, 20, 200]))]
     o += ["--restarts", str(r.randint(1, 3))]
+    o += ["--vrank", str(r.randint(1, 8))]
+    o += ["--pick2", str(r.choice([1, 1, 2, 3, 16]))]
+    o += ["--reloc-side", r.choice(["coin", "long"])]
+    o += ["--pair", str(r.choice([0, 1, -1]))]
+    o += ["--race", r.choice(["off", "off", "0.0005", "0.002", "0.5"])]
+    o += ["--race-at", str(r.choice([0.05, 0.25, 0.9]))]
     o += ["--cw-rand", r.choice(["off", "perturb", "param", "both"])]
     o += ["--cw-alpha", str(r.choice([0.0, 0.03, 0.4, 0.9]))]
     o += ["--split", r.choice(["off", "cw", "end", "both"])]

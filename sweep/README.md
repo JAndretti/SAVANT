@@ -71,7 +71,7 @@ adding an option to a study needs no change on the analysis side.
 ## Why the numbers are trustworthy
 
 **Comparisons are paired.** Instance *k* is generated from `seed + k`
-(`cw.c:2064`), so every run of a study sees byte-identical instances. The
+(`cw.c:2574`), so every run of a study sees byte-identical instances. The
 analysis compares `cost_i(A)` with `cost_i(B)` on the same instance and reports
 the mean of the 1000 differences with a 95 % CI, plus a distribution-free sign
 test. Comparing two means with their independent standard deviations would be
@@ -101,8 +101,8 @@ exceeds the entire annealing cost.
   U{1..9}, capacity from `default_capacity`). Nothing here is evidence about
   clustered or real-world instances — run `tools/fetch_neuopt.py` and point the
   sweep at `--bundle` for that.
-- `--sa-knn K` is clamped to `n-1` (`cw.c:1399`), so at n = 20 the values 30 and
+- `--sa-knn K` is clamped to `n-1` (`cw.c:1675`), so at n = 20 the values 30 and
   50 are the same run as 19. The analysis prints the effective K.
 - At `--sa-knn 0` the vertex-selection rule is silently forced to uniform
-  (`cw.c:1400`) while the header still prints the requested `--pick`. The
+  (`cw.c:1676`) while the header still prints the requested `--pick`. The
   `pick` study crosses the two knobs specifically to expose this.

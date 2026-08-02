@@ -31,15 +31,18 @@
 
 /* ------------------------------------------------------------------ output */
 
+#define NOPS 6                  /* relocate, swap, 2-opt, or-opt, swap*, open */
+
 typedef struct {
-    long   draws[4];        /* moves drawn per operator                      */
-    long   acc[4];          /* of those, accepted                            */
-    double gain[4];         /* summed delta of the accepted ones (<0 = good) */
-    double best_at[4];      /* cost improvement that set a new best          */
-    long   newbest[4];      /* number of times this operator set a new best  */
+    long   draws[NOPS];     /* moves drawn per operator                      */
+    long   acc[NOPS];       /* of those, accepted                            */
+    double gain[NOPS];      /* summed delta of the accepted ones (<0 = good) */
+    double best_at[NOPS];   /* cost improvement that set a new best          */
+    long   newbest[NOPS];   /* number of times this operator set a new best  */
 } OpStats;
 
-static const char *OPNAME[4] = { "relocate", "swap", "2-opt", "or-opt" };
+static const char *OPNAME[NOPS] = { "relocate", "swap", "2-opt", "or-opt",
+                                    "swap*", "opening" };
 
 /* mkdir -p, so `results/` need not already exist */
 static void ensure_dir(const char *path)
@@ -103,24 +106,12 @@ static double trace_anneal(const Inst *in, WS *w, const Opts *o, Sol *S,
     const int n = S->n, R = S->R, steps = o->sa_steps;
     if (steps <= 0) return cur;
 
-    int K = o->sa_knn; if (K > n - 1) K = n - 1; if (K < 0) K = 0;
-    w->pick_t = (K > 0) ? o->pick_t : 1;
-    w->crit = o->pick_crit; w->or_max = o->or_max;
-    {   double wt = o->w_rel + o->w_swap + o->w_2opt + o->w_or;
-        double c1 = o->w_rel / wt, c2 = c1 + o->w_swap / wt, c3 = c2 + o->w_2opt / wt;
-        w->th1 = (uint32_t)(c1 * 4294967296.0);
-        w->th2 = (uint32_t)(c2 * 4294967296.0);
-        w->th3 = (uint32_t)(c3 * 4294967296.0);
-        if (o->w_or <= 0.0) w->th3 = 0xFFFFFFFFu;
-    }
-    xy_build(in, w);
-    if (K > 0) {
-        knn_need(in, w, K); lb_build(in, w, K);
-        double m = 0.0;
-        for (int u = 1; u <= n; u++) m += w->lb[u];
-        w->eps0 = o->pick_eps * m / (2.0 * n);
-    } else if (w->crit == 0 || w->crit == 2) w->pick_t = 1;
-    else w->eps0 = o->pick_eps * cur / (double)(n + R);
+    /* the operator thresholds, the kNN/bound setup and the selection knobs
+       come straight from the solver's own sa_config(), so this trace can
+       never drift from cw.c */
+    w->inc = w->inc_o; w->bnx = w->bnx_o; w->bad = w->bad_o;   /* chain 0 */
+    w->xy_ok = 0; w->lb_k = -1;
+    int K = sa_config(in, w, o, n, R, cur);
     inc_build(in, w, S);
 
     Rng rng; rng_seed(&rng, seed);
@@ -147,7 +138,8 @@ static double trace_anneal(const Inst *in, WS *w, const Opts *o, Sol *S,
         /* same threshold comparison sa_draw() makes, so the RNG stream and the
            resulting trajectory are identical to a plain cw run */
         uint32_t z = rng32(&rng);
-        int op = (z < w->th1) ? 0 : (z < w->th2) ? 1 : (z < w->th3) ? 2 : 3;
+        int op = (z < w->th1) ? 0 : (z < w->th2) ? 1 : (z < w->th3) ? 2
+               : (z < w->th4) ? 3 : (z < w->th5) ? 4 : 5;
 
         long acc_before = w->acc;
         double d;
@@ -155,7 +147,9 @@ static double trace_anneal(const Inst *in, WS *w, const Opts *o, Sol *S,
             case 0:  d = mv_relocate(in, w, S, K, T, &rng, 0); break;
             case 1:  d = mv_swap    (in, w, S, K, T, &rng, 0); break;
             case 2:  d = mv_2opt    (in, w, S, K, T, &rng, 0); break;
-            default: d = mv_oropt   (in, w, S, K, T, &rng, 0); break;
+            case 3:  d = mv_oropt   (in, w, S, K, T, &rng, 0); break;
+            case 4:  d = mv_swapstar(in, w, S, K, T, &rng, 0); break;
+            default: d = mv_open    (in, w, S, K, T, &rng, 0); break;
         }
         int accepted = (w->acc > acc_before);
 
@@ -207,7 +201,8 @@ static void trace_usage(void)
 "Annealing (same meaning and defaults as cw):\n"
 "  --sa-steps N       default 100000\n"
 "  --sa-knn K         default 20\n"
-"  --ops r,s,t,o      default 1,1,1,0\n"
+"  --ops r,s,t,o[,x,e]  default 1,1,1,0,0,0 (x = swap*, e = opening)\n"
+"  --vrank T | --pick2 T | --reloc-side coin|long\n"
 "  --or-max L         default 3\n"
 "  --pick T           default 2        --pick-crit lb|rem|remnorm|raw\n"
 "  --pick-eps E       default 0.3\n"
@@ -239,6 +234,9 @@ int main(int argc, char **argv)
     o.restarts = 1; o.cw_rand = 0; o.cw_alpha = 0.03;
     o.pick_t = 2; o.pick_eps = 0.3; o.pick_crit = 0; o.sa_knn = 20;
     o.w_rel = 1.0; o.w_swap = 1.0; o.w_2opt = 1.0; o.w_or = 0.0; o.or_max = 3;
+    o.w_sstar = 0.0; o.w_open = 0.0;
+    o.pick2 = 1; o.vrank = 1; o.reloc_side = 0; o.pair = 0;
+    o.race = 0.0; o.race_at = 0.25;
 
     const char *out = NULL, *name = NULL;
     int index = 0, want_csv = 1, init_random = 0;
@@ -280,10 +278,18 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--ops")) {
             char buf[128], *c; snprintf(buf, sizeof buf, "%s", NEXT());
             for (c = buf; *c; c++) if (*c == ':' || *c == '/') *c = ',';
-            o.w_rel = o.w_swap = o.w_2opt = o.w_or = 0.0;
-            if (sscanf(buf, "%lf,%lf,%lf,%lf", &o.w_rel, &o.w_swap,
-                       &o.w_2opt, &o.w_or) < 1)
-                die("--ops: expected format r,s,t[,o]");
+            o.w_rel = o.w_swap = o.w_2opt = o.w_or = o.w_sstar = o.w_open = 0.0;
+            if (sscanf(buf, "%lf,%lf,%lf,%lf,%lf,%lf", &o.w_rel, &o.w_swap,
+                       &o.w_2opt, &o.w_or, &o.w_sstar, &o.w_open) < 1)
+                die("--ops: expected format r,s,t[,o[,x[,e]]]");
+        }
+        else if (!strcmp(a, "--vrank"))        o.vrank = atoi(NEXT());
+        else if (!strcmp(a, "--pick2"))        o.pick2 = atoi(NEXT());
+        else if (!strcmp(a, "--reloc-side")) {
+            const char *v = NEXT();
+            if      (!strcmp(v, "coin")) o.reloc_side = 0;
+            else if (!strcmp(v, "long")) o.reloc_side = 1;
+            else die("--reloc-side: coin | long");
         }
         else if (!strcmp(a, "--pick-crit")) {
             const char *v = NEXT();
@@ -397,7 +403,7 @@ int main(int argc, char **argv)
 
     double final = sol_cost(&inst, &S);
     long total_draws = 0, total_acc = 0;
-    for (int i = 0; i < 4; i++) { total_draws += st.draws[i]; total_acc += st.acc[i]; }
+    for (int i = 0; i < NOPS; i++) { total_draws += st.draws[i]; total_acc += st.acc[i]; }
 
     /* ------------------------------------------------------------ summary */
     snprintf(path, sizeof path, "%s/trace.json", outdir);
@@ -429,7 +435,7 @@ int main(int argc, char **argv)
     fprintf(jf, "  \"draws\": %ld,\n", total_draws);
     fprintf(jf, "  \"accepted\": %ld,\n", total_acc);
     fprintf(jf, "  \"operators\": [\n");
-    for (int i = 0; i < 4; i++)
+    for (int i = 0; i < NOPS; i++)
         fprintf(jf, "    {\"name\": \"%s\", \"weight\": %g, \"draws\": %ld, "
                     "\"accepted\": %ld, \"accept_rate\": %.6f, "
                     "\"sum_delta\": %.10f, \"new_best\": %ld}%s\n",
@@ -453,7 +459,7 @@ int main(int argc, char **argv)
            fabs(final - tracked));
     printf("\n%-10s %10s %10s %8s %12s %9s\n",
            "operator", "draws", "accepted", "rate", "sum delta", "new best");
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < NOPS; i++) {
         if (!st.draws[i]) continue;
         printf("%-10s %10ld %10ld %7.2f%% %12.5f %9ld\n",
                OPNAME[i], st.draws[i], st.acc[i],

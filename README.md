@@ -158,7 +158,7 @@ There are **three** representations, each used by a different phase. Take this
 
 ### During Clarke & Wright — adjacency lists + union-find
 
-No route lists at all. Each customer stores **at most two neighbours** (src/cw.c:1558):
+No route lists at all. Each customer stores **at most two neighbours** (src/cw.c:1887):
 
 ```c
 int *uf, *deg, *adj;   /* adj is 2*(n+1): adj[2*i], adj[2*i+1] */
@@ -177,7 +177,7 @@ This is why **no route reversal is ever needed**: merging `A—i` with `j—B` i
 one of them would have to be reversed — which is exactly what `check.py`'s naive
 reference does with `A[::-1] + B`.
 
-Routes are materialised only once, at the end (src/cw.c:1579), by walking each chain
+Routes are materialised only once, at the end (src/cw.c:1908), by walking each chain
 from an endpoint.
 
 ### During annealing — doubly linked lists with virtual depots
@@ -216,7 +216,7 @@ by the move set.)
 ### On output — flat array, then text
 
 `sol_out` packs routes into `[n_words, c.., 0, c.., 0]` with `0` as separator
-(src/cw.c:1665), written as the self-describing `--sol` text:
+(src/cw.c:2164), written as the self-describing `--sol` text:
 
 ```
 #CWSOL 1
@@ -251,12 +251,12 @@ That is a genuine difference in search power, not an implementation detail.
 
 | site | check | line |
 |---|---|---|
-| C&W merge | `load[ri] + load[rj] > cap + EPS` → skip the saving | src/cw.c:1567 |
-| relocate | `load[rv] + dem[u] > cap + EPS` | src/cw.c:992 |
-| swap | both directions: `load[ru] − du + dv` and `load[rv] − dv + du` | src/cw.c:1028 |
-| or-opt | `load[rv] + sload > cap + EPS` (segment load) | src/cw.c:1104 |
-| 2-opt\* | prefix/tail loads recomputed, both new routes checked | src/cw.c:1192 |
-| Split | capacity *is* the recurrence: window `D[j] − D[i] ≤ Q` | src/cw.c:1305 |
+| C&W merge | `load[ri] + load[rj] > cap + EPS` → skip the saving | src/cw.c:1896 |
+| relocate | `load[rv] + dem[u] > cap + EPS` | src/cw.c:1058 |
+| swap | both directions: `load[ru] − du + dv` and `load[rv] − dv + du` | src/cw.c:1094 |
+| or-opt | `load[rv] + sload > cap + EPS` (segment load) | src/cw.c:1170 |
+| 2-opt\* | prefix/tail loads recomputed, both new routes checked | src/cw.c:1425 |
+| Split | capacity *is* the recurrence: window `D[j] − D[i] ≤ Q` | src/cw.c:1538 |
 
 Two subtleties:
 
@@ -267,7 +267,7 @@ hot path. Intra-route 2-opt (segment reversal) has no check at all, for the same
 reason.
 
 **`load[]` is maintained incrementally**, updated on each accepted move
-(src/cw.c:1005), so a check costs two array reads rather than summing a route.
+(src/cw.c:1071), so a check costs two array reads rather than summing a route.
 
 The `EPS = 1e-9` tolerance appears in every comparison (`> cap + EPS`) because
 demands may be fractional (`edge/frac.cvrpb` uses Q = 7.5 with demands like 0.196);
@@ -283,24 +283,24 @@ an exact `>` would reject legitimate moves on rounding alone.
   positions, or-opt moves a contiguous block, 2-opt reverses or exchanges tails. A
   customer physically cannot appear twice or vanish.
 - **Split**: reconstructs from the giant tour `t[1..n]`, asserted to hold exactly n
-  entries (`if (L != n) return -1.0`, src/cw.c:1277).
+  entries (`if (L != n) return -1.0`, src/cw.c:1510).
 
 ### Verified rather than assumed
 
 Because "guaranteed by construction" is exactly the kind of claim that quietly stops
 being true, it is checked three times independently:
 
-1. **`solve_cw` exit check** (src/cw.c:1652): a `seen[]` sweep sets `feasible = 0` on any
+1. **`solve_cw` exit check** (src/cw.c:2163): a `seen[]` sweep sets `feasible = 0` on any
    out-of-range index, duplicate, unserved customer or overloaded route. Reported as
    `feasible` in the CSV, and drives exit code 2.
-2. **`--validate`** re-reads the written file and recomputes everything (src/cw.c:1761).
+2. **`--validate`** re-reads the written file and recomputes everything (src/cw.c:2216).
 3. **`validate.py`**, sharing no code with the solver — the version that carries
    evidential weight. On the full 10 000-instance CVRP-100 run: 0 errors, max cost
    deviation 4.3e-16.
 
 On a genuinely infeasible instance — `edge/infeasible.cvrpb`, one demand of 99
 against Q = 30 — no amount of checking helps. The solver detects it, reports
-`feasible=0`, exits 2, and Split refuses to run (src/cw.c:1289). That guard exists
+`feasible=0`, exits 2, and Split refuses to run (src/cw.c:1522). That guard exists
 because the fuzzer found a segfault there.
 
 ---
@@ -312,7 +312,7 @@ What happens, in order, and what each option controls. Line references point int
 
 ## 1. Top level — one instance
 
-`solve_cw` (src/cw.c:1474) is called once per instance, from an OpenMP loop over
+`solve_cw` (src/cw.c:1977) is called once per instance, from an OpenMP loop over
 instances.
 
 ```
@@ -337,7 +337,7 @@ for rs = 0 .. restarts-1:              ── --restarts
 restore best restart, verify coverage/capacity, emit
 ```
 
-### Savings list size (src/cw.c:1482)
+### Savings list size (src/cw.c:1986)
 
 | `--knn` | behaviour |
 |---|---|
@@ -347,7 +347,7 @@ restore best restart, verify coverage/capacity, emit
 
 Clamped to `1 <= K <= n-1`.
 
-### Two properties of the restart loop (src/cw.c:1508)
+### Two properties of the restart loop (src/cw.c:2036)
 
 **Restart 0 is always deterministic C&W.** `rnd = (rs > 0) ? o->cw_rand : 0`, so
 `--restarts 1` reproduces no-restart behaviour bit-for-bit, and a multi-start can
@@ -356,8 +356,8 @@ never end up worse than a single start.
 **Seeds are derived from the instance seed**, not from a thread-local stream:
 
 ```c
-C&W seed  = seed * 0xD1342543DE82EF95 + rs * 0x9E3779B97F4A7C15   // src/cw.c:1510
-anneal    = (seed ^ 0x5DEECE66D)      + rs * 0xBF58476D1CE4E5B9   // src/cw.c:1613
+C&W seed  = seed * 0xD1342543DE82EF95 + rs * 0x9E3779B97F4A7C15   // src/cw.c:1839
+anneal    = (seed ^ 0x5DEECE66D)      + rs * 0xBF58476D1CE4E5B9   // src/cw.c:1942
 ```
 
 Results are therefore independent of `--threads` and of scheduling order — verified
@@ -365,28 +365,29 @@ by MD5 on the solution file at 1, 2, 4 and 12 threads.
 
 ### `--2opt` is a construction post-process
 
-Applied per route during chain reconstruction (src/cw.c:1591), first-improvement to a
+Applied per route during chain reconstruction (src/cw.c:1920), first-improvement to a
 local optimum, *before* the linked-list representation exists. It is not part of the
 annealing neighbourhood — the SA has its own 2-opt operator.
 
 ## 2. Inside `anneal()`
 
-`anneal` is at src/cw.c:1394.
+The annealing chain machinery starts at src/cw.c:1672 (`sa_config`, `chain_init`,
+`chain_step`, `anneal_chains`).
 
 ### 2.1 Setup, in order
 
-**Step 1 — clamp K, resolve `--pick`** (src/cw.c:1400)
+**Step 1 — clamp K, resolve `--pick`** (src/cw.c:1676)
 
 ```c
 K = sa_knn;  clamp to [0, n-1]
 pick_t = (K > 0) ? o->pick_t : 1;      // the regret needs the kNN lists
 ```
 
-A second downgrade at src/cw.c:1416: if `K == 0` and `--pick-crit` is `lb` or `remnorm`
+A second downgrade at src/cw.c:1701: if `K == 0` and `--pick-crit` is `lb` or `remnorm`
 (both read `lb[]`), `pick_t` falls back to 1 as well. In short, **`--pick` has no
 effect under `--sa-knn 0`.**
 
-**Step 2 — operator thresholds** (src/cw.c:1403)
+**Step 2 — operator thresholds** (src/cw.c:1680)
 
 The four `--ops` weights are normalised into cumulative `uint32` cut-points, so
 choosing an operator costs three integer comparisons on one random word rather than
@@ -399,7 +400,7 @@ th3 = th2 + (w_2opt / S) * 2^32
 if (w_or <= 0) th3 = 0xFFFFFFFF;
 ```
 
-**Step 3 — `xy_build`** (src/cw.c:772). Interleaved `(x,y)` per vertex, with the virtual
+**Step 3 — `xy_build`** (src/cw.c:799). Interleaved `(x,y)` per vertex, with the virtual
 depots `n+1 .. 2n+3` filled with the real depot's coordinates. This is what lets
 `dxy` avoid any "is this a depot?" test.
 
@@ -409,10 +410,10 @@ depots `n+1 .. 2n+3` filled with the real depot's coordinates. This is what lets
 eps0 = pick_eps * sum(lb[u]) / (2n)    // ~ pick_eps * mean nearest-neighbour distance
 ```
 
-**Step 5 — `inc_build`** (src/cw.c:935). Fills `inc[u]` (cost of u's two current edges)
+**Step 5 — `inc_build`** (src/cw.c:967). Fills `inc[u]` (cost of u's two current edges)
 for every u, plus `bad[u]`, plus the Fenwick tree when `--pick 0`.
 
-**Step 6 — temperature** (src/cw.c:1426)
+**Step 6 — temperature** (src/cw.c:1725)
 
 ```c
 if (--t0 given)  T0 = t0,  Tend = tend            // default tend = t0 * 1e-4
@@ -420,7 +421,7 @@ else             T0 = calibrate_T0(...),  Tend = T0 * 10^(-t_decades)
 alpha = (Tend / T0)^(1/(steps-1))                 // geometric, one step per iteration
 ```
 
-`calibrate_T0` (src/cw.c:1378) draws up to 2000 moves in **probe mode** — delta computed,
+`calibrate_T0` (src/cw.c:1613) draws up to 2000 moves in **probe mode** — delta computed,
 move not applied — and collects the first 300 worsening deltas:
 
 ```
@@ -434,12 +435,12 @@ accepting an average-badness worsening move on step 0** — substituting back gi
 * Calibration samples the neighbourhood of the **C&W starting solution only**, so T0
   reflects the initial landscape, not the whole trajectory.
 * If no worsening move is found in 2000 draws, `T0 = 0` and **annealing is skipped
-  entirely** (src/cw.c:1429). This is the frozen-solution guard for degenerate instances
+  entirely** (src/cw.c:1728). This is the frozen-solution guard for degenerate instances
   — all points coincident, `n = 1`, and similar.
 
 Calibration consumes the same RNG stream the main loop continues from.
 
-### 2.2 The main loop (src/cw.c:1438)
+### 2.2 The main loop (src/cw.c:1738)
 
 ```c
 for (it = 0; it < steps; it++) {
@@ -479,7 +480,7 @@ apply the move
 inc_upd() on the 4-6 vertices whose neighbourhood changed
 ```
 
-**`pick_u`** (src/cw.c:952) — three modes:
+**`pick_u`** (src/cw.c:987) — three modes:
 
 | `--pick` | mechanism | cost |
 |---|---|---|
@@ -491,10 +492,10 @@ The tournament caps selection pressure at approximately `T/n` no matter how extr
 a vertex's regret is. The Fenwick sampler does not, which is the mechanism proposed
 [below](#exactly-proportional-sampling---pick-0) for why it loses.
 
-**`sa_cand`** (src/cw.c:971) returns a uniform draw from `u`'s kNN list, falling back to
+**`sa_cand`** (src/cw.c:1010) returns a uniform draw from `u`'s kNN list, falling back to
 a uniform customer if `K == 0` or the slot is empty.
 
-**`--pick-crit`** selects the regret formula in `bad_of` (src/cw.c:906). All four are
+**`--pick-crit`** selects the regret formula in `bad_of` (src/cw.c:933). All four are
 built on the incrementally-maintained `inc[u]` and clamped at 0:
 
 | name | formula | note |
@@ -504,7 +505,7 @@ built on the incrementally-maintained `inc[u]` and clamped at 0:
 | `remnorm` | `rem / lb[u]` | normalised by local density |
 | `raw` | `inc[u]` | raw cost of the two carried edges |
 
-**`sa_accept`** (src/cw.c:825):
+**`sa_accept`** (src/cw.c:852):
 
 ```c
 if (delta <= 0.0)      return 1;
@@ -515,20 +516,73 @@ return rng_unit(rng) < exp(-delta / T);
 `exp(-36) ~ 2e-16` is below double resolution, so the early reject is exact and
 removes the division from the dominant case.
 
-### 2.4 The four operators
+### 2.4 The six operators
 
 | operator | intra-route | inter-route | delta | apply |
 |---|---|---|---|---|
-| `relocate` (src/cw.c:980) | move one customer | same, with capacity check | O(1) | O(1) |
-| `swap` (src/cw.c:1017) | exchange two customers | same, both capacities checked | O(1) | O(1) |
-| `2-opt` (src/cw.c:1137) | reverse a segment | 2-opt\* (tail exchange) | O(1) | O(L) |
-| `or-opt` (src/cw.c:1082) | move a 2..`--or-max` segment, optionally reversed | same | O(1) | O(L), L <= 8 |
+| `relocate` (src/cw.c:1040) | move one customer | same, with capacity check | O(1) | O(1) |
+| `swap` (src/cw.c:1083) | exchange two customers | same, both capacities checked | O(1) | O(1) |
+| `2-opt` (src/cw.c:1362) | reverse a segment | 2-opt\* (tail exchange) | O(1) | O(L) |
+| `or-opt` (src/cw.c:1148) | move a 2..`--or-max` segment, optionally reversed | same | O(1) | O(L), L <= 8 |
+| `swap*` (src/cw.c:1216) | — (inter-route only) | exchange two customers, each reinserted at its **best** position in the other's route | O(L₁+L₂) | O(1) |
+| `opening` (src/cw.c:1325) | — | isolate one customer in an empty route | O(1) | O(1) |
 
-Default weights are `1,1,1,0` — **or-opt is off by default**. Together the first
-three are clearly better than any of them alone (pure descent on CVRP-100:
-`1,0,0` → 16.451, `0,1,0` → 16.477, `0,0,1` → 16.460, `1,1,1` → 16.370).
+Default weights are `1,1,1,0,0,0` — **or-opt, swap\* and opening are off by
+default**, so the defaults reproduce the four-operator solver exactly. The first
+three together are clearly better than any of them alone (pure descent on
+CVRP-100: `1,0,0` → 16.451, `0,1,0` → 16.477, `0,0,1` → 16.460, `1,1,1` → 16.370).
 
-**The 2-opt trick** (src/cw.c:1160) is the notable one. On a cycle, reversing the segment
+**`swap*`** (Vidal, *Hybrid genetic search for the CVRP*, C&OR 2022) is the only
+non-elementary operator. Ordinary `swap` forces `u` into `v`'s slot; `swap*`
+drops that constraint and reinserts each customer where it fits best in the
+other's route. Because the two routes are disjoint the two reinsertions are
+independent, so the delta is still **exact** despite the scan. The second vertex
+is drawn *by route*, not by proximity: the kNN neighbour `w0` selects the target
+**route**, then `v` is the worse (by regret) of two uniform customers of that
+route — requiring `v` near `u` is too restrictive, since `v` will not be placed
+near `u` anyway.
+
+Note that for a given pair, the in-place exchange is one of the positions
+`swap*` sweeps, so Δ(swap\*) ≤ Δ(swap) always. `swap` is nevertheless kept as a
+separate operator (it is ~10× cheaper per draw); whether to drop it is a
+weighting decision, not a code one — `--ops 1,0,1,0,1,0.05` drops it.
+
+**`opening`** is almost always worsening, and that is the point. The annealer can
+empty a route but never repopulate an empty one, so the number of active routes
+is a one-way door between two Splits. This move reopens it, at the cost of the
+intermediate states the annealer cannot cross. Use a small weight (0.05).
+
+#### Measured effect
+
+2000 instances of `data/cvrp_100.cvrpb`, `--restarts 10 --split end
+--split-every 1000`, 12 threads. Everything is compared **at equal wall time**,
+which is the only comparison that means anything: `swap*` costs ~20 % more per
+step, so an equal-step win is not a win.
+
+| config | steps | mean cost | wall |
+|---|---|---|---|
+| baseline `1,1,1,0` | 100 000 | 15.8487 | 7.0 s |
+| baseline `1,1,1,0` | 140 000 | 15.8178 | 10.1 s |
+| baseline `1,1,1,0` | 200 000 | 15.7870 | 14.9 s |
+| `1,1,1,0,1,0` (+ swap\*) | 100 000 | 15.7529 | 8.4 s |
+| `1,1,1,0,0,0.05` (+ opening) | 100 000 | 15.8422 | 7.2 s |
+| `1,1,1,0,1,0.05` + `--reloc-side long --race 0.002` | 100 000 | **15.7156** | 9.2 s |
+| `1,0,1,0,1,0.05` + `--reloc-side long --race 0.002` | 100 000 | **15.7057** | 12.0 s |
+
+The baseline needs 14.9 s to reach 15.787; the new operators reach 15.716 in
+9.2 s. Almost all of the gain is `swap*` (−0.096 on its own). `opening` alone is
+worth little (−0.006) but is nearly free. Dropping `swap` in favour of `swap*`
+(`1,0,1,...`) buys a further −0.010 but costs 30 % more time, so at equal time it
+is roughly a wash here — unlike in Yann Vaxès' variant, where `swap` is dropped
+outright.
+
+One difference worth flagging: `--vrank 2 --sa-knn 30`, which pays off in his
+version, **costs** here (15.735 → 15.787 at equal steps). His construction shares
+a single K = 30 kNN list between savings and annealing, whereas this one builds
+exact savings for n ≤ 1500, so the two are not tuned against the same baseline.
+Left off by default; worth revisiting if the savings K is ever unified.
+
+**The 2-opt trick** (src/cw.c:1385) is the notable one. On a cycle, reversing the segment
 `nxt[a]..b` or its complement produces the same undirected cycle: the removed edges
 are `(a, nxt[a])` and `(b, nxt[b])`, the added edges `(a,b)` and `(nxt[a], nxt[b])`,
 either way. So the delta is symmetric in `a` and `b`, needs no knowledge of their
@@ -545,7 +599,7 @@ exact to the bit — the neighbours have not changed since the last `inc_upd`.
 
 ### Where it runs
 
-`--split` is a bitmask (src/cw.c:1604, src/cw.c:1622):
+`--split` is a bitmask (src/cw.c:1933, src/cw.c:1951):
 
 | value | bit 0 — after C&W | bit 1 — after annealing |
 |---|---|---|
@@ -556,7 +610,7 @@ exact to the bit — the neighbours have not changed since the last `inc_upd`.
 
 `--split-every N` additionally fires inside the SA loop every N steps.
 
-### The algorithm (src/cw.c:1244)
+### The algorithm (src/cw.c:1477)
 
 Prins' DP with Vidal's O(n) sliding-window minimum. With `D[i]` the cumulative demand
 up to `t[i]` and `C[i]` the path length `t[1]..t[i]`:
@@ -569,12 +623,12 @@ F(i) = P[i] + d0(t[i+1]) - C[i+1]
 `F` does not depend on `j`, and since `D` is increasing the feasible window is a
 sliding interval — a monotone deque gives O(n) overall.
 
-**Infeasibility guard** (src/cw.c:1289). The sliding window relies on the invariant
+**Infeasibility guard** (src/cw.c:1522). The sliding window relies on the invariant
 "predecessor `j-1` is always feasible", which holds because `D[j] - D[j-1]` is one
 customer's demand. If a single demand exceeds capacity that invariant breaks, the
 deque empties, and `dq[head]` reads out of bounds. The code checks every demand up
 front and declines to split (returns `-1.0`) on an infeasible instance. There is a
-redundant guard inside the loop at src/cw.c:1306.
+redundant guard inside the loop at src/cw.c:1539.
 
 ### `--split-tour`
 
@@ -584,7 +638,7 @@ redundant guard inside the loop at src/cw.c:1306.
 | `sweep` | routes sorted by the polar angle of their centroid, each oriented to minimise the join to the previous one |
 | `both` (default) | run both, keep the better |
 
-`split_apply` (src/cw.c:1339) compares the two and, if `sweep` came out worse, re-runs
+`split_apply` (src/cw.c:1572) compares the two and, if `sweep` came out worse, re-runs
 mode 0 to revert — the operation is idempotent, so this restores the better
 partition.
 
@@ -624,7 +678,27 @@ multi-start.
 --restarts R   R C&W constructions, annealed independently, best kept
 --cw-rand M    off | perturb (default) | param | both
 --cw-alpha A   perturb amplitude (default 0.03)
+--race M       racing margin between starts, or off (default off)
+--race-at F    fraction of the budget at which the checkpoint sits (default 0.25)
+--pair P       0 = off (default) | 1 = on | -1 = auto (n >= 400)
 ```
+
+**Racing (`--race`)** redistributes the budget instead of spending it equally.
+At `--race-at` of its budget, a start that is worse than the best *finished*
+start was **at the same point of its own trajectory** (same temperature — the
+comparison at equal fraction is what makes it meaningful) by a relative margin
+`M` is abandoned. Its unspent steps lengthen the schedules of the following
+starts, and whatever is left over at the end polishes the best solution found.
+Total step budget is unchanged; only its allocation is.
+
+**Interleaving (`--pair 1`)** advances two starts alternately in the same loop,
+so the memory latency of one overlaps with the computation of the other. It is
+pure engineering: each chain owns its solution, its incremental buffers and its
+random stream, and only transient scratch is shared, so the trajectories are
+unchanged bit for bit. The one exception is when `--race` is also on: racing
+makes the budget depend on how starts are *grouped*, so `--pair 1 --race M`
+follows a different (equally valid) schedule from `--pair 0 --race M`.
+Incompatible with `--pick 0`, whose Fenwick tree is shared state.
 
 ### SA schedule
 ```
@@ -638,13 +712,30 @@ multi-start.
 
 ### SA neighbourhood and selection
 ```
---ops r,s,t,o  operator weights (default 1,1,1,0)
+--ops r,s,t,o[,x,e]  operator weights: relocate, swap, 2-opt, or-opt,
+                     swap*, opening        (default 1,1,1,0,0,0)
 --or-max L     or-opt max segment length, 2..8 (default 3)
 --sa-knn K     candidate neighbourhood size (default 20, 0 = uniform)
 --pick T       0 = Fenwick proportional, 1 = uniform, T>=2 = tournament (default 2)
 --pick-crit C  lb (default) | rem | remnorm | raw
 --pick-eps E   Fenwick smoothing, only used by --pick 0 (default 0.3)
+--vrank T      rank bias on the second vertex: the kNN index drawn is the
+               min of T uniform draws (default 1 = uniform, no bias)
+--pick2 T      tournament of size T on the second vertex, on the regret
+               (default 1 = none)
+--reloc-side S relocate insertion side: coin (default) | long
 ```
+
+`--vrank` costs nothing: the kNN lists are already sorted by distance, so the
+minimum of T uniform indices is a bias towards the nearer neighbours with no
+memory access at all. It is meant to be **coupled with a larger `--sa-knn`**
+(the longer list gives the reach, the rank bias restores the concentration);
+either one alone tends to hurt.
+
+`--reloc-side long` breaks the longer of the two edges adjacent to `v` instead
+of flipping a coin, which maximises the `-d(v,q)` term of the insertion cost.
+Two reads, no randomness; the diversity of insertion positions is still carried
+by the draw of `v` among the kNN.
 
 ### Split
 ```
@@ -1136,7 +1227,7 @@ Outcome: 250 trials with the optimised binary and 90 under ASan/UBSan, zero fail
 ### What the fuzzing found
 
 **Out-of-bounds read in Split, on an infeasible instance** — the guard now at
-src/cw.c:1289. A segfault reproducible on any run combining `--split` with an infeasible
+src/cw.c:1522. A segfault reproducible on any run combining `--split` with an infeasible
 instance. It was the textbook example of the implicit assumption one does not think to
 test: the reasoning was correct *on a feasible instance*.
 
@@ -1197,7 +1288,7 @@ affects the validity of the results above.
 
 ### 1. Emptied routes can never be refilled
 
-The comment at src/cw.c:737 states that an empty route "stays available for a later
+The comment at src/cw.c:764 states that an empty route "stays available for a later
 reinsertion". The move set does not deliver this.
 
 `sa_cand` only ever returns a **customer** — the kNN lists contain customers only. In
@@ -1205,23 +1296,23 @@ relocate and or-opt the insertion point is `v` or `prv[v]`; `prv` of a customer 
 either another customer or the virtual depot of that customer's route, which is
 necessarily non-empty. So `rid[v]` is never an empty route. Swap preserves route
 sizes. 2-opt\* maps two routes to two routes and *can* empty one (when `ia == -1` and
-`ib == LB-1`, src/cw.c:1198).
+`ib == LB-1`, src/cw.c:1431).
 
 Net effect: **the route count is monotone non-increasing during annealing.** Only
-Split can raise it again (src/cw.c:1334). For distance-minimising CVRP this is rarely
+Split can raise it again (src/cw.c:1567). For distance-minimising CVRP this is rarely
 costly — C&W's route count is generally at or above the optimum — but the SA cannot
 explore any solution using more vehicles than C&W produced.
 
 ### 2. `--split-every` breaks the O(1)-per-step design
 
-Each trigger runs `split_apply` **and** `inc_build`, both O(n) (src/cw.c:1441). At
+Each trigger runs `split_apply` **and** `inc_build`, both O(n) (src/cw.c:1744). At
 `--split-every 1` the loop costs O(n) per step. The finding that periodic Split
 "stands slightly out of the noise" is measured in *steps*; at equal *time* it would
 look worse still.
 
 ### 3. `--ops r,s,t,0` does not strictly disable or-opt
 
-With `w_or <= 0`, src/cw.c:1408 sets `th3 = 0xFFFFFFFF`, and `sa_draw` tests `z < th3`.
+With `w_or`, `w_sstar` and `w_open` all <= 0, src/cw.c:1687 sets `th3 = 0xFFFFFFFF`, and `sa_draw` tests `z < th3`.
 The single value `z == 0xFFFFFFFF` still falls through to or-opt — roughly once per
 4 × 10⁹ draws. Harmless, since the operator is correct and `or_max` defaults to a
 valid 3, but "disabled" is off by one.
@@ -1231,11 +1322,11 @@ valid 3, but "disabled" is off by one.
 Two independent sources of divergence that the reported 2.5e-12 agreement attributes
 solely to float addition order:
 
-* `cw.c` truncates each saving to **float32** before sorting (src/cw.c:1530), so two
+* `cw.c` truncates each saving to **float32** before sorting (src/cw.c:1859), so two
   savings differing by less than ~1e-7 relative become exact ties in C but not in
   `check.py`'s float64 sort.
 * `cw.c` iterates the stable radix sort **backwards**
-  (`for (size_t t = m; t-- > 0; )`, src/cw.c:1563), consuming ties in reverse insertion
+  (`for (size_t t = m; t-- > 0; )`, src/cw.c:1892), consuming ties in reverse insertion
   order; `check.py` sorts by `-s` with Python's stable sort, consuming ties in forward
   `(i,j)` order.
 
@@ -1251,7 +1342,7 @@ reference implementation.
 It holds for the `routes` concatenation — the current partition is itself a feasible
 cut of its own concatenation — but not for `sweep`, which builds a different giant
 tour whose optimal split may exceed the current cost. `split_apply` handles this by
-comparing and reverting (src/cw.c:1351), so the *net* behaviour is safe; the invariant as
+comparing and reverting (src/cw.c:1584), so the *net* behaviour is safe; the invariant as
 written just does not cover the `sweep` path.
 
 ---
