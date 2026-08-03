@@ -86,6 +86,21 @@ def main():
     lo, hi = md - 1.96 * se, md + 1.96 * se
     print(f"  95 % CI         : [{100 * lo / mean_a:+.4f} %, "
           f"{100 * hi / mean_a:+.4f} %]")
+
+    # On a set of uniform size the two agree. On a heterogeneous one (Set X
+    # spans costs from 11k to 337k) the ratio of means above is dominated by
+    # the largest instances, so the mean of the per-instance relative gaps is
+    # the statistic that actually answers "which solver is better here".
+    rels = [100.0 * (B[i] - A[i]) / A[i] for i in common if A[i] > 0]
+    if rels:
+        mr = sum(rels) / len(rels)
+        vr = (sum((r - mr) ** 2 for r in rels) / (len(rels) - 1)
+              if len(rels) > 1 else 0.0)
+        ser = math.sqrt(vr / len(rels))
+        print(f"  per-instance    : {mr:+.4f} %  +/- {ser:.4f} % "
+              f"(mean of the relative gaps)")
+        print(f"  95 % CI         : [{mr - 1.96 * ser:+.4f} %, "
+              f"{mr + 1.96 * ser:+.4f} %]")
     print()
     print(f"  B better on     : {wins_b:5d} / {n}  ({100 * wins_b / n:.1f} %)")
     print(f"  A better on     : {wins_a:5d} / {n}  ({100 * wins_a / n:.1f} %)")

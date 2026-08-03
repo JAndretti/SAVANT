@@ -20,6 +20,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -57,6 +58,15 @@ def load_run(path):
                 break
         else:
             budget = "it=20000 (default)"
+    elif solver == "LKH-3":
+        par = cfg.get("lkh_par", {})
+        budget = (f"t={par['TIME_LIMIT']}" if "TIME_LIMIT" in par
+                  else f"trials={par.get('MAX_TRIALS', 'default')}")
+    elif solver == "AILS-II":
+        # -limit is wall clock, not CPU; flagged so the column is not read as
+        # if it were the same kind of budget as HGS's -t.
+        m = re.search(r"-limit (\S+)", cfg.get("command", ""))
+        budget = f"t={m.group(1)} (wall)" if m else ""
     else:
         args = cfg.get("cw_args", [])
         budget = ""

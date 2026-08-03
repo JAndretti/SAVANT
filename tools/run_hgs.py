@@ -67,6 +67,7 @@ RESULTS = os.path.join(ROOT, "results")
 
 sys.path.insert(0, HERE)
 from bundle_to_vrp import read_bundle, write_vrp, instance_name  # noqa: E402
+from fetch_cvrplib import read_vrp as read_cvrplib_vrp  # noqa: E402
 
 
 ROUTE_RE = re.compile(r"^Route #(\d+)\s*:\s*(.*)$")
@@ -149,7 +150,15 @@ def solve_one(job):
         return {"idx": idx, "name": name, "error": f"launch failed: {e}",
                 "wall": time.perf_counter() - t0}
     wall = time.perf_counter() - t0
-    if p.returncode != 0 or not os.path.exists(out):
+    if p.returncode == 0 and not os.path.exists(out):
+        # main.cpp writes nothing and still exits 0 when getBestFound() is
+        # NULL, i.e. when no *feasible* solution was reached inside the budget.
+        # Common on the tight Set X instances (X-n524-k153 needs 155 routes)
+        # at a short -t. Not a crash, but not a result either.
+        return {"idx": idx, "name": name, "wall": wall,
+                "error": "no feasible solution found within the budget "
+                         "(HGS wrote no file)"}
+    if p.returncode != 0:
         return {"idx": idx, "name": name, "wall": wall,
                 "error": f"exit {p.returncode}: "
                          f"{(p.stdout + p.stderr).strip()[:200]}"}
@@ -187,11 +196,15 @@ def main():
         description="Run HGS-CVRP over a .cvrpb bundle into a validatable run "
                     "directory",
     )
-    ap.add_argument("--bundle", required=True, help="instances (.cvrpb)")
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--bundle", help="instances (.cvrpb)")
+    src.add_argument("--dir", dest="indir",
+                     help="directory of TSPLIB .vrp files (CVRPLib sets X, XL, "
+                          "XML100); used as is, keeping the real instance names")
     ap.add_argument("--hgs", default=DEFAULT_HGS, help="hgs binary")
     ap.add_argument("--vrp", default=None,
-                    help="directory of exported .vrp files (default: "
-                         "data/vrp_<stem>, created and reused)")
+                    help="with --bundle: directory of exported .vrp files "
+                         "(default: data/vrp_<stem>, created and reused)")
     ap.add_argument("--limit", type=int, default=0,
                     help="solve only the first N instances")
     ap.add_argument("--time", type=float, default=0.0, metavar="SEC",
@@ -203,10 +216,13 @@ def main():
     ap.add_argument("--veh", type=int, default=0,
                     help="HGS -veh: prescribed fleet size (default: HGS's own "
                          "estimate, 1.3 x bin-packing LB + 3)")
-    ap.add_argument("--round", dest="rounded", type=int, default=0,
-                    choices=(0, 1),
-                    help="integer distances (default 0 — the NeuOpt "
-                         "coordinates live in [0,1] and MUST NOT be rounded)")
+    ap.add_argument("--round", dest="rounded", default="auto",
+                    choices=("auto", "0", "1"),
+                    help="integer distances. auto (default) infers it from the "
+                         "coordinates: integral -> 1 (TSPLIB EUC_2D, as in "
+                         "CVRPLib X/XL/XML100), otherwise 0 (as in the NeuOpt "
+                         "sets, whose [0,1] coordinates must NOT be rounded). "
+                         "The decision is always printed")
     ap.add_argument("--jobs", type=int, default=os.cpu_count(),
                     help="parallel HGS processes (default: all cores)")
     ap.add_argument("--name", help="readable suffix for the run directory")
@@ -226,30 +242,70 @@ def main():
               "default of 20000 non-improving iterations (~6 s/instance at "
               "n=100 on this machine)", file=sys.stderr)
 
-    insts = read_bundle(args.bundle, args.limit)
-    if not insts:
-        raise SystemExit(f"{args.bundle}: no instance")
+    # --- load the instances and settle on the .vrp HGS will actually read ---
+    exported = 0
+    if args.indir:
+        # CVRPLib sets: the .vrp files are the source of truth, and their names
+        # carry meaning (X-n101-k25), so they are used as they are distributed.
+        # Sorting by name matches `cw --dir`, which sorts too, so index k means
+        # the same instance for both solvers and for the *_bks.csv reference.
+        names = sorted(f[:-4] for f in os.listdir(args.indir)
+                       if f.endswith(".vrp"))
+        if args.limit:
+            names = names[:args.limit]
+        if not names:
+            raise SystemExit(f"{args.indir}: no .vrp file")
+        insts = [read_cvrplib_vrp(os.path.join(args.indir, nm + ".vrp"))
+                 for nm in names]
+        vrpdir = args.indir
+        source = args.indir
+        # fetch_cvrplib.py writes data/cvrplib/<SET>.cvrpb alongside <SET>/,
+        # in this same order; validate.py needs it to recompute the costs.
+        # --limit keeps the first N of the same sorted order, and validate.py
+        # matches on the index, so a truncated run still validates against the
+        # full bundle.
+        cand = os.path.normpath(args.indir.rstrip("/")) + ".cvrpb"
+        bundle_ref = cand if os.path.exists(cand) else None
+    else:
+        insts = read_bundle(args.bundle, args.limit)
+        if not insts:
+            raise SystemExit(f"{args.bundle}: no instance")
+        stem = os.path.splitext(os.path.basename(args.bundle))[0]
+        width = len(str(len(insts) - 1))
+        names = [instance_name(stem, k, width) for k in range(len(insts))]
+        vrpdir = args.vrp or os.path.join(ROOT, "data",
+                                          "vrp_" + stem.split("_")[-1])
+        os.makedirs(vrpdir, exist_ok=True)
+        for k, (n, cap, xs, ys, ds) in enumerate(insts):
+            path = os.path.join(vrpdir, names[k] + ".vrp")
+            if not os.path.exists(path):
+                write_vrp(path, names[k], n, cap, xs, ys, ds)
+                exported += 1
+        source = args.bundle
+        bundle_ref = args.bundle
+
     n_all = {n for n, _, _, _, _ in insts}
 
-    if args.rounded and any(
-        any(abs(v - round(v)) > 1e-12 for v in xs[:5] + ys[:5])
-        for _, _, xs, ys, _ in insts[:5]
-    ):
-        ap.error("--round 1 on continuous coordinates would collapse every "
-                 "distance; this is almost certainly not what you want")
-
-    # --- export the .vrp files (reused across runs) -----------------------
-    stem = os.path.splitext(os.path.basename(args.bundle))[0]
-    vrpdir = args.vrp or os.path.join(ROOT, "data", "vrp_" + stem.split("_")[-1])
-    os.makedirs(vrpdir, exist_ok=True)
-    width = len(str(len(insts) - 1))
-    exported = 0
-    for k, (n, cap, xs, ys, ds) in enumerate(insts):
-        name = instance_name(stem, k, width)
-        path = os.path.join(vrpdir, name + ".vrp")
-        if not os.path.exists(path):
-            write_vrp(path, name, n, cap, xs, ys, ds)
-            exported += 1
+    # --- rounding: inferred unless forced, and always reported --------------
+    integral = all(
+        all(abs(v - round(v)) < 1e-9 for v in xs[:8] + ys[:8])
+        for _, _, xs, ys, _ in insts[:8]
+    )
+    if args.rounded == "auto":
+        rounded = 1 if integral else 0
+        why = ("integral coordinates -> TSPLIB EUC_2D convention"
+               if integral else "continuous coordinates -> no rounding")
+    else:
+        rounded = int(args.rounded)
+        why = "forced"
+        if rounded and not integral:
+            ap.error("--round 1 on continuous coordinates would collapse every "
+                     "distance; this is almost certainly not what you want")
+        if not rounded and integral:
+            print("warning: --round 0 on integral coordinates — the CVRPLib "
+                  "sets are scored with rounding, so any comparison against "
+                  "their BKS will be meaningless", file=sys.stderr)
+    args.rounded = rounded
 
     argv = ["-round", str(args.rounded), "-log", "0", "-seed", str(args.seed)]
     if args.time > 0:
@@ -263,11 +319,24 @@ def main():
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", args.name).strip("-") if args.name else ""
     run_dir = os.path.join(args.out, f"{stamp}_{slug}" if slug else stamp)
 
-    print(f"bundle    : {args.bundle}  ({len(insts)} instances, n = {sorted(n_all)})")
+    nspan = (f"{min(n_all)}..{max(n_all)}" if len(n_all) > 1
+             else str(next(iter(n_all))))
+    print(f"source    : {source}  ({len(insts)} instances, n = {nspan})")
     print(f"vrp       : {vrpdir}" + (f"  (+{exported} exported)" if exported else ""))
+    print(f"rounding  : -round {args.rounded}   ({why})")
     print(f"hgs       : {args.hgs} {' '.join(argv)}")
     print(f"jobs      : {args.jobs}")
     print(f"directory : {run_dir}")
+    if max(n_all) > 2000:
+        # The dense n x n double matrix is 0.75 GiB at n = 10000, but the
+        # measured peak is ~2.3 GiB once the row vectors and the granular
+        # structures are counted — about 3x the naive figure, so estimate
+        # from that rather than from n^2 * 8.
+        peak = 3.0 * max(n_all) ** 2 * 8 / 2**30
+        print(f"note      : HGS is memory-hungry on large instances — measured "
+              f"~{peak:.1f} GiB at n = {max(n_all)}, and you are asking for "
+              f"{args.jobs} concurrent jobs ({peak * args.jobs:.0f} GiB peak). "
+              f"Lower --jobs on Set XL.", file=sys.stderr)
     if args.dry_run:
         return 0
 
@@ -277,8 +346,7 @@ def main():
     os.makedirs(soldir, exist_ok=True)
 
     jobs = [
-        (k, instance_name(stem, k, width),
-         os.path.join(vrpdir, instance_name(stem, k, width) + ".vrp"),
+        (k, names[k], os.path.join(vrpdir, names[k] + ".vrp"),
          soldir, args.hgs, argv)
         for k in range(len(insts))
     ]
@@ -349,7 +417,7 @@ def main():
     solpath = os.path.join(run_dir, "solutions.txt")
     with open(solpath, "w") as f:
         f.write(f"#CWSOL 1\n#instances {len(insts)}\n")
-        f.write(f"#source {args.bundle}\n")
+        f.write(f"#source {source}\n")
         f.write(f"#round {args.rounded}\n")
         f.write(f"#solver HGS-CVRP {' '.join(argv)}\n")
         f.write("#format inst <idx> <name> <n> <Q> <cost> <routes>, "
@@ -386,8 +454,12 @@ def main():
             "jobs": args.jobs,
         },
         "command": f"{args.hgs} <instance> <sol> {' '.join(argv)}",
-        # read by validate.py to locate the instances
-        "cw_args": ["--bundle", os.path.relpath(os.path.abspath(args.bundle), ROOT)],
+        # read by validate.py to locate the instances. A --dir run points at
+        # the bundle fetch_cvrplib.py wrote for the same set, whose instance
+        # order is the same sorted-by-name order used here.
+        "cw_args": ["--bundle", os.path.relpath(os.path.abspath(bundle_ref), ROOT)]
+                   if bundle_ref else ["--dir", source],
+        "instance_names": names if args.indir else None,
         "hgs_args": argv,
         "hgs_commit": hgs_version(os.path.join(ROOT, "external", "HGS-CVRP")),
         "binary": binary_fingerprint(args.hgs),

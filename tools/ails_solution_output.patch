@@ -1,0 +1,52 @@
+Add a `-solution <file>` option to AILS-II so the routes can be checked.
+
+Applied to https://github.com/INFORMSJoC/2023.0106 (AILS-II, Máximo, Cordeau,
+Nascimento), which otherwise prints only a cost line — leaving its numbers as
+the only ones in this repository that could not be independently revalidated.
+
+The change is confined to main(): it reads one extra argument directly from
+argv, without touching InputParameters, and writes the best solution through
+the Solution.toString() that already exists. Solution.toString() emits
+"Route #k: a b c" lines followed by "Cost <f>", i.e. exactly the CVRPLib .sol
+format, with the depot as node 0 and customers numbered 1..n. No search
+parameter, no acceptance rule and no operator is touched, so the trajectory is
+bit-identical to the unpatched code.
+
+Apply with:
+    patch -p0 -d external/AILS-II < tools/ails_solution_output.patch
+
+--- src/SearchMethod/AILSII.java
++++ src/SearchMethod/AILSII.java
+@@
+ 	public static void main(String[] args)
+ 	{
+ 		InputParameters reader=new InputParameters();
+ 		reader.readingInput(args);
+
+ 		Instance instance=new Instance(reader);
+
+ 		AILSII ailsII=new AILSII(instance,reader);
+
+ 		ailsII.search();
++
++		// -solution <file>: write the best solution in CVRPLib .sol format.
++		// Read straight from argv so InputParameters is left untouched.
++		String solutionFile=null;
++		for(int i=0;i<args.length-1;i++)
++			if(args[i].equals("-solution"))
++				solutionFile=args[i+1];
++		if(solutionFile!=null)
++		{
++			try
++			{
++				java.io.PrintWriter out=new java.io.PrintWriter(solutionFile);
++				out.print(ailsII.getBestSolution().toString());
++				out.close();
++			}
++			catch(java.io.IOException e)
++			{
++				System.err.println("could not write "+solutionFile+": "+e);
++				System.exit(1);
++			}
++		}
+ 	}

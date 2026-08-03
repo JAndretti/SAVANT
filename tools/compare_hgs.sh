@@ -37,3 +37,6 @@ for S in 100000 300000 1000000 3000000; do
 done
 
 echo "### done"
+echo
+echo "For the CVRPLib sets (X, XL, XML100), which are ROUNDED and ship"
+echo "reference solutions, see tools/compare_cvrplib.sh instead."
