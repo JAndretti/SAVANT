@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # run_sweep.sh — parameter sweep for ./cw
 #
-# Every execution writes three files into sweep/results/<study>/:
+# Every execution writes three files into sweep/results/<tier>/s<seed>/<study>/:
 #     <tag>.log    raw cw output (resolved config header + summary)
 #     <tag>.csv    per-instance results (--csv)
 #     <tag>.meta   study, tag, exact command line, exit code, wall time
@@ -10,16 +10,40 @@
 # in the tag: analyze_sweep.py re-parses it into an option dict, so adding an
 # option here needs no change on the analysis side.
 #
-# All runs of a study share the same (n, m, seed), hence the *same instances*
-# (instance k is generated from seed+k, cw.c:2064). Comparisons are therefore
-# paired, which is what analyze_sweep.py exploits.
+# TWO THINGS THE LAYOUT ENCODES
+#
+# *Seeds.* Every configuration is run at each seed in $SEEDS (5 by default).
+# `--seed` drives both the instance set (instance k is generated from seed+k,
+# cw.c:2574) and the annealing RNG (cw.c:2679) -- cw has no separate solver
+# seed -- so a seed is a fresh instance set solved with fresh randomness.
+# Within one seed the comparison is exactly paired; analyze_sweep.py pools the
+# per-instance deltas across seeds, so a study's conclusion rests on 5 x $M
+# paired instances and cannot be an artefact of one instance draw.
+#
+# *Tiers.* A knob tuned at 10^5 annealing steps need not still be the right
+# setting at 10^7, which is where this solver is actually run. Each tier fixes
+# its own ($M, $STEPS); the tags are identical across tiers, so the analysis can
+# put the same comparison at the two budgets side by side and show which
+# recommendations move. Step counts that used to be absolute are now multiples
+# of $STEPS, so every ladder rescales with the tier.
+#
+#     tier   instances   sa-steps   what it is
+#     lo         1000        10^5   the historical sweep, kept for the contrast
+#     hi          200        10^7   the operating point, + 3x10^7 on `tuned`
+#
+# $M is smaller at `hi` because the budget per run is 100x larger; pooled over
+# the 5 seeds the `hi` tier still carries 1000 paired instances per comparison,
+# the same as the headline pairing in the top-level README.
 #
 # Usage:
-#     sweep/run_sweep.sh                 # everything
+#     sweep/run_sweep.sh                 # everything: both tiers, all seeds
 #     sweep/run_sweep.sh init ops        # only those studies
-#     M=200 sweep/run_sweep.sh           # fewer instances (quick check)
+#     TIERS=hi sweep/run_sweep.sh        # only the operating-point tier
+#     SEEDS="42 43" sweep/run_sweep.sh   # fewer seeds (quick check)
+#     M=200 sweep/run_sweep.sh           # override the tier's instance count
 #     RESUME=1 sweep/run_sweep.sh        # skip runs already on disk
 #     sweep/run_sweep.sh --list          # list the studies
+#     sweep/run_sweep.sh --plan          # count the runs, run nothing
 
 set -u
 shopt -s inherit_errexit 2>/dev/null || true
@@ -34,29 +58,44 @@ BIN=${BIN:-$ROOT/cw}
 OUT=${OUT:-$ROOT/sweep/results}
 
 # ---------------------------------------------------------------- defaults
-M=${M:-1000}            # instances per run
-SEED=${SEED:-42}        # instance seed (same instances across every run)
-N=${N:-100}             # default dimension
-STEPS=${STEPS:-100000}  # default SA budget
-RESUME=${RESUME:-0}     # 1 = skip a run whose .meta already exists
+SEEDS=${SEEDS:-"42 43 44 45 46"}   # >=5: the study is replicated on each
+TIERS=${TIERS:-"lo hi"}            # which budget tiers to run
+N=${N:-100}                        # default dimension
+RESUME=${RESUME:-0}                # 1 = skip a run whose .meta already exists
+PLAN=0
+
+# Per-tier (instances, sa-steps). M/STEPS in the environment override both.
+tier_M()     { case $1 in lo) echo 1000;; hi) echo 200;; esac; }
+tier_STEPS() { case $1 in lo) echo 100000;; hi) echo 10000000;; esac; }
 
 STUDIES=(init ops newops knn timing restarts split pick select race temp
          construct tuned)
 
-n_run=0; n_skip=0; n_fail=0
+n_run=0; n_skip=0; n_fail=0; n_plan=0
 FAILED=()
 T_START=$(date +%s)
 
 usage() {
-    echo "usage: $0 [--list] [study ...]"
+    echo "usage: $0 [--list] [--plan] [study ...]"
     echo "studies: ${STUDIES[*]}"
-    echo "env: M=$M SEED=$SEED N=$N STEPS=$STEPS RESUME=$RESUME OUT=$OUT"
+    echo "env: SEEDS='$SEEDS' TIERS='$TIERS' N=$N RESUME=$RESUME OUT=$OUT"
+    echo "     M/STEPS override the per-tier defaults (lo: 1000/1e5, hi: 200/1e7)"
+}
+
+# mul <numerator> <denominator> -- a multiple of $STEPS, floored at 1.
+# Every absolute step count in the studies below goes through this, which is
+# what makes the whole sweep rescale when the tier changes.
+mul() {
+    local v=$(( STEPS * $1 / $2 ))
+    [[ $v -lt 1 ]] && v=1
+    echo "$v"
 }
 
 # run <study> <tag> <cw args...>
 run() {
     local study=$1 tag=$2; shift 2
-    local dir="$OUT/$study"
+    if [[ $PLAN == 1 ]]; then n_plan=$((n_plan + 1)); return 0; fi
+    local dir="$OUT/$TIER/s$SEED/$study"
     mkdir -p "$dir"
     local base="$dir/$tag"
 
@@ -74,6 +113,8 @@ run() {
     {
         echo "study=$study"
         echo "tag=$tag"
+        echo "tier=$TIER"
+        echo "seed=$SEED"
         echo "cmd=${cmd[*]}"
         echo "exit=$rc"
         echo "wall_s=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.3f", b-a}')"
@@ -81,10 +122,11 @@ run() {
 
     n_run=$((n_run + 1))
     if [[ $rc -ne 0 ]]; then
-        n_fail=$((n_fail + 1)); FAILED+=("$study/$tag")
+        n_fail=$((n_fail + 1)); FAILED+=("$TIER/s$SEED/$study/$tag")
         printf '  [FAIL rc=%d] %s/%s\n' "$rc" "$study" "$tag"
     else
-        printf '  [%3d] %-12s %-34s %6.2fs\n' "$n_run" "$study" "$tag" \
+        printf '  [%4d] %-2s s%-3s %-10s %-32s %7.2fs\n' \
+               "$n_run" "$TIER" "$SEED" "$study" "$tag" \
                "$(awk -v a="$t0" -v b="$t1" 'BEGIN{print b-a}')"
     fi
     return 0
@@ -93,17 +135,26 @@ run() {
 # common instance-source arguments for a given n
 src() { echo "--random -n $1 -m $M --seed $SEED"; }
 
-banner() { printf '\n=== %s: %s\n' "$1" "$2"; }
+banner() { printf '\n=== %s [%s s%s]: %s\n' "$1" "$TIER" "$SEED" "$2"; }
 
 # ============================================================== S1  init
 # Does a random initial solution catch up with Clarke & Wright, and how fast?
-# Same SA budget on both sides, budget swept over three decades.
+# Same SA budget on both sides, budget swept over three decades below $STEPS.
+# At `lo` the rungs are the historical 10^3..10^6; at `hi` they are 10^5..10^7,
+# so in both tiers the ladder ends at the tier's own operating point.
 study_init() {
     banner init "random vs C&W construction across the SA budget"
-    local steps n init
+    local rungs n init r steps
+    if [[ $TIER == lo ]]; then
+        rungs=("1 100" "1 50" "1 20" "1 10" "1 5" "1 2" "1 1" "2 1" "5 1" "10 1")
+    else
+        rungs=("1 100" "1 50" "1 20" "1 10" "1 5" "1 2" "1 1")
+    fi
     for n in 20 50 100 200; do
         for init in cw random; do
-            for steps in 1000 2000 5000 10000 20000 50000 100000 200000 500000 1000000; do
+            for r in "${rungs[@]}"; do
+                set -- $r
+                steps=$(mul "$1" "$2")
                 run init "n${n}_${init}_s${steps}" \
                     $(src "$n") --sa-steps "$steps" --init "$init"
             done
@@ -147,8 +198,6 @@ study_ops() {
 study_newops() {
     banner newops "swap* and route opening: weights, and the iso-time question"
     local X E cfg mult steps n
-
-    # one operator at a time, against the stock default
     for X in 0.25 0.5 1 2 4; do
         run newops "sstar_$X" $(src "$N") --sa-steps "$STEPS" --ops "1,1,1,0,$X,0"
     done
@@ -173,8 +222,7 @@ study_newops() {
         for mult in "x0125 1 8" "x025 1 4" "x05 1 2" \
                     "x1 1 1" "x2 2 1" "x4 4 1"; do
             set -- $mult                       # $1=tag  $2=numerator  $3=denom
-            steps=$(( STEPS * $2 / $3 ))
-            [[ $steps -lt 1 ]] && steps=1
+            steps=$(mul "$2" "$3")
             run newops "bud_${cfg%%:*}_$1" \
                 $(src "$N") --sa-steps "$steps" --ops "${cfg#*:}"
         done
@@ -212,16 +260,20 @@ study_knn() {
 # run-to-run spread on the construction (+-3 %) is then larger than the whole
 # annealing cost, and the two runs sit in different memory-pressure regimes.
 # A 2S delta is not enough either -- 10S puts the signal well clear of the noise.
+#
+# At `hi` the 10S rung would be 10^8 steps, which dominates the whole sweep for
+# a result that is about the cost model rather than about quality; the timing
+# study therefore stays on the `lo` step counts in both tiers (only $M moves).
 study_timing() {
     banner timing "cost of construction vs annealing across n, and thread scaling"
-    local n T
+    local n T S=100000
     for n in 20 50 100 200 500 1000; do
         run timing "n${n}_nosa"  $(src "$n") --no-sa
-        run timing "n${n}_sa"    $(src "$n") --sa-steps "$STEPS"
-        run timing "n${n}_sa10"  $(src "$n") --sa-steps $((STEPS * 10))
+        run timing "n${n}_sa"    $(src "$n") --sa-steps "$S"
+        run timing "n${n}_sa10"  $(src "$n") --sa-steps $((S * 10))
     done
     for T in 1 2 4 8 12 16 24; do
-        run timing "threads_$T" $(src "$N") --sa-steps "$STEPS" --threads "$T"
+        run timing "threads_$T" $(src "$N") --sa-steps "$S" --threads "$T"
     done
 }
 
@@ -231,12 +283,13 @@ study_timing() {
 #     "given a fixed number of SA steps, how should they be split?".
 study_restarts() {
     banner restarts "restart count, at fixed and at equal total budget"
-    local R S
+    local R S FIXED BUDGET A MODE
+    FIXED=$(mul 1 10)          # per-restart budget for the (a) block
+    BUDGET=$(mul 32 10)        # total budget held constant in the (b) block
     for R in 1 2 4 8 16 32; do
-        run restarts "fixed_R${R}"  $(src "$N") --sa-steps 10000 --restarts "$R"
+        run restarts "fixed_R${R}"  $(src "$N") --sa-steps "$FIXED" --restarts "$R"
     done
 
-    local BUDGET=320000
     for R in 1 2 4 8 16 32; do
         S=$((BUDGET / R))
         run restarts "iso_R${R}"    $(src "$N") --sa-steps "$S" --restarts "$R"
@@ -249,11 +302,12 @@ study_restarts() {
     done
 
     # how the restart diversity is produced
+    S=$(mul 4 10)
     for MODE in off perturb param both; do
-        run restarts "cwrand_$MODE" $(src "$N") --sa-steps 40000 --restarts 8 --cw-rand "$MODE"
+        run restarts "cwrand_$MODE" $(src "$N") --sa-steps "$S" --restarts 8 --cw-rand "$MODE"
     done
     for A in 0.01 0.03 0.1 0.3 0.9; do   # cw.c:2041 requires 0 <= alpha < 1
-        run restarts "alpha_$A"     $(src "$N") --sa-steps 40000 --restarts 8 \
+        run restarts "alpha_$A"     $(src "$N") --sa-steps "$S" --restarts 8 \
             --cw-rand perturb --cw-alpha "$A"
     done
 }
@@ -262,23 +316,28 @@ study_restarts() {
 # --split (where Split is applied) and --split-every (periodic Split during
 # annealing) are independent code paths (cw.c:1440 vs 1640/1658), so the full
 # grid including "off + every" is meaningful.
+#
+# --split-every is a period in steps, so its grid is scaled with the tier too:
+# "every 1000 steps out of 10^5" and "every 1000 out of 10^7" are not the same
+# experiment, and holding the *number of Splits* fixed is the comparable choice.
 study_split() {
     banner split "--split mode x --split-every, and --split-tour"
-    local MODE EV n
+    local MODE EV n TOUR E100 E1k E10k
+    E100=$(mul 1 1000); E1k=$(mul 1 100); E10k=$(mul 1 10)
     for MODE in off cw end both; do
-        for EV in 0 100 1000 10000; do
+        for EV in 0 "$E100" "$E1k" "$E10k"; do
             run split "m${MODE}_e${EV}" $(src "$N") --sa-steps "$STEPS" \
                 --split "$MODE" --split-every "$EV"
         done
     done
     for TOUR in routes sweep both; do
         run split "tour_$TOUR" $(src "$N") --sa-steps "$STEPS" \
-            --split both --split-every 1000 --split-tour "$TOUR"
+            --split both --split-every "$E1k" --split-tour "$TOUR"
     done
     # more routes at larger n means more for Split to repartition
     for n in 200 500; do
         for MODE in off both; do
-            for EV in 0 1000; do
+            for EV in 0 "$E1k"; do
                 run split "n${n}_m${MODE}_e${EV}" $(src "$n") --sa-steps "$STEPS" \
                     --split "$MODE" --split-every "$EV"
             done
@@ -322,7 +381,7 @@ study_pick() {
 # to hurt. That claim is only testable on the full grid, hence the cross.
 study_select() {
     banner select "--vrank x --sa-knn, --pick2, --reloc-side"
-    local V K T S
+    local V K T S n
     for V in 1 2 3 4; do
         for K in 10 20 30 50; do
             run select "vrank${V}_K${K}" $(src "$N") --sa-steps "$STEPS" \
@@ -356,8 +415,8 @@ study_select() {
 # schedule, because racing makes the budget depend on how starts are grouped.
 study_race() {
     banner race "--race margin x --race-at, and --pair interleaving"
-    local BUDGET=400000 R S MARGIN AT n
-
+    local BUDGET R S MARGIN AT n
+    BUDGET=$(mul 4 1)
     R=10; S=$((BUDGET / R))
     for MARGIN in off 0.0005 0.002 0.01 0.05 0.2; do
         run race "margin_${MARGIN}" $(src "$N") --sa-steps "$S" --restarts "$R" \
@@ -384,12 +443,14 @@ study_race() {
 
 # ============================================================== S8  temp
 # Annealing schedule: initial acceptance target and the number of decades
-# spanned by T.
+# spanned by T. This is the knob most likely to move with the budget: the
+# geometric ratio is (Tend/T0)^(1/(steps-1)), so the same number of decades is
+# traversed 100x more slowly at the `hi` tier.
 study_temp() {
     banner temp "--t-accept x --t-decades"
     local A D
     for A in 0.0001 0.001 0.01 0.1 0.5; do
-        for D in 1 2 3 4; do
+        for D in 1 2 3 4 5 6; do
             run temp "a${A}_d${D}" $(src "$N") --sa-steps "$STEPS" \
                 --t-accept "$A" --t-decades "$D"
         done
@@ -399,7 +460,8 @@ study_temp() {
 # ============================================================== S9  construct
 # Construction quality on its own (--no-sa) and after annealing. The interesting
 # question is whether a better construction survives the SA, or whether the SA
-# washes the difference out.
+# washes the difference out -- and that is exactly the question whose answer
+# should depend on the budget, so it is worth having in both tiers.
 study_construct() {
     banner construct "savings parameters, construction kNN and 2-opt"
     local L MU K
@@ -428,62 +490,103 @@ study_construct() {
 # Candidate combinations against the stock defaults, at equal SA budget. These
 # are hypotheses, not the outcome of the sweep: analyze_sweep.py reports the
 # per-study winners so the combination can be rebuilt from the actual results.
+#
+# This is the "headline" study, so at the `hi` tier it also gets a 3x rung
+# (3x10^7 steps) on the two configurations that matter -- enough to say whether
+# the default-vs-tuned ordering is still moving at the top of the range.
 study_tuned() {
     banner tuned "candidate combinations vs defaults, at equal budget"
-    local n
+    local n S8 S3
+    S8=$((STEPS / 8))
     for n in 50 100 200; do
         run tuned "n${n}_default"  $(src "$n") --sa-steps "$STEPS"
         run tuned "n${n}_oropt"    $(src "$n") --sa-steps "$STEPS" --ops 1,1,1,1
         run tuned "n${n}_critrem"  $(src "$n") --sa-steps "$STEPS" --pick-crit rem
-        run tuned "n${n}_split"    $(src "$n") --sa-steps "$STEPS" --split both --split-every 1000
+        run tuned "n${n}_split"    $(src "$n") --sa-steps "$STEPS" --split both \
+            --split-every "$(mul 1 100)"
         run tuned "n${n}_all"      $(src "$n") --sa-steps "$STEPS" --ops 1,1,1,1 \
-            --pick-crit rem --split both --split-every 1000
-        run tuned "n${n}_all_r8"   $(src "$n") --sa-steps $((STEPS / 8)) --restarts 8 \
-            --ops 1,1,1,1 --pick-crit rem --split both --split-every 1000
+            --pick-crit rem --split both --split-every "$(mul 1 100)"
+        run tuned "n${n}_all_r8"   $(src "$n") --sa-steps "$S8" --restarts 8 \
+            --ops 1,1,1,1 --pick-crit rem --split both --split-every "$(mul 1 100)"
 
         # the new operators, alone and folded into the combination above
         run tuned "n${n}_newops"   $(src "$n") --sa-steps "$STEPS" --ops 1,1,1,0,1,0.05
         run tuned "n${n}_newall"   $(src "$n") --sa-steps "$STEPS" --ops 1,1,1,0,1,0.05 \
-            --reloc-side long --split both --split-every 1000
+            --reloc-side long --split both --split-every "$(mul 1 100)"
         # multi-restart, where racing has something to redistribute
-        run tuned "n${n}_r8"       $(src "$n") --sa-steps $((STEPS / 8)) --restarts 8
-        run tuned "n${n}_newall_r8" $(src "$n") --sa-steps $((STEPS / 8)) --restarts 8 \
+        run tuned "n${n}_r8"       $(src "$n") --sa-steps "$S8" --restarts 8
+        run tuned "n${n}_newall_r8" $(src "$n") --sa-steps "$S8" --restarts 8 \
             --ops 1,1,1,0,1,0.05 --reloc-side long --race 0.002 \
-            --split both --split-every 1000
+            --split both --split-every "$(mul 1 100)"
     done
+
+    # the 3x rung: is the default-vs-tuned ordering still moving at the top?
+    if [[ $TIER == hi ]]; then
+        S3=$(mul 3 1)
+        for n in 100 200; do
+            run tuned "n${n}_x3_default" $(src "$n") --sa-steps "$S3"
+            run tuned "n${n}_x3_newall"  $(src "$n") --sa-steps "$S3" \
+                --ops 1,1,1,0,1,0.05 --reloc-side long --split both \
+                --split-every "$(mul 1 100)"
+        done
+    fi
 }
 
 # ==========================================================================
 main() {
-    if [[ ${1:-} == --list || ${1:-} == -h || ${1:-} == --help ]]; then usage; return 0; fi
+    local args=()
+    for a in "$@"; do
+        case $a in
+            --list|-h|--help) usage; return 0 ;;
+            --plan) PLAN=1 ;;
+            *) args+=("$a") ;;
+        esac
+    done
     [[ -x $BIN ]] || { echo "$BIN not found or not executable: run \`make\` first" >&2; return 1; }
 
-    local wanted=("$@")
-    [[ ${#wanted[@]} -eq 0 ]] && wanted=("${STUDIES[@]}")
+    local wanted=("${args[@]:-}")
+    [[ ${#args[@]} -eq 0 ]] && wanted=("${STUDIES[@]}")
 
     mkdir -p "$OUT"
     printf 'binary   : %s\n' "$BIN"
     printf 'output   : %s\n' "$OUT"
-    printf 'instances: m=%s seed=%s (identical across every run)\n' "$M" "$SEED"
-    printf 'defaults : n=%s sa-steps=%s\n' "$N" "$STEPS"
+    printf 'seeds    : %s   (each is a fresh instance set AND fresh solver RNG)\n' "$SEEDS"
+    printf 'tiers    : %s\n' "$TIERS"
     printf 'studies  : %s\n' "${wanted[*]}"
 
-    "$BIN" --help >"$OUT/cw_help.txt" 2>&1
-    (cd "$ROOT" && git rev-parse HEAD 2>/dev/null) >"$OUT/git_head.txt" 2>/dev/null || true
-    md5sum "$BIN" >"$OUT/binary.md5" 2>/dev/null || true
+    if [[ $PLAN == 0 ]]; then
+        "$BIN" --help >"$OUT/cw_help.txt" 2>&1
+        (cd "$ROOT" && git rev-parse HEAD 2>/dev/null) >"$OUT/git_head.txt" 2>/dev/null || true
+        md5sum "$BIN" >"$OUT/binary.md5" 2>/dev/null || true
+    fi
 
     local s
-    for s in "${wanted[@]}"; do
-        if ! declare -F "study_$s" >/dev/null; then
-            echo "unknown study: $s (known: ${STUDIES[*]})" >&2; n_fail=$((n_fail+1)); continue
-        fi
-        "study_$s"
+    for TIER in $TIERS; do
+        M=${M_OVERRIDE:-$(tier_M "$TIER")}
+        STEPS=${STEPS_OVERRIDE:-$(tier_STEPS "$TIER")}
+        [[ -n $M && -n $STEPS ]] || { echo "unknown tier: $TIER (known: lo hi)" >&2; return 1; }
+        printf '\n########## tier %s: m=%s sa-steps=%s\n' "$TIER" "$M" "$STEPS"
+        for SEED in $SEEDS; do
+            for s in "${wanted[@]}"; do
+                if ! declare -F "study_$s" >/dev/null; then
+                    echo "unknown study: $s (known: ${STUDIES[*]})" >&2
+                    n_fail=$((n_fail+1)); continue
+                fi
+                "study_$s"
+            done
+        done
     done
+
+    if [[ $PLAN == 1 ]]; then
+        printf '\nplanned runs: %d\n' "$n_plan"
+        return 0
+    fi
 
     local elapsed=$(( $(date +%s) - T_START ))
     printf '\n--------------------------------------------------\n'
-    printf 'runs: %d  skipped: %d  failed: %d  elapsed: %dm%02ds\n' \
-           "$n_run" "$n_skip" "$n_fail" $((elapsed / 60)) $((elapsed % 60))
+    printf 'runs: %d  skipped: %d  failed: %d  elapsed: %dh%02dm%02ds\n' \
+           "$n_run" "$n_skip" "$n_fail" \
+           $((elapsed / 3600)) $((elapsed % 3600 / 60)) $((elapsed % 60))
     if [[ ${#FAILED[@]} -gt 0 ]]; then
         printf 'failed runs:\n'; printf '  %s\n' "${FAILED[@]}"
     fi
@@ -491,4 +594,8 @@ main() {
     return 0
 }
 
+# M / STEPS in the environment override the per-tier defaults; captured before
+# main() so the per-tier assignment does not clobber them.
+M_OVERRIDE=${M:-}
+STEPS_OVERRIDE=${STEPS:-}
 main "$@"

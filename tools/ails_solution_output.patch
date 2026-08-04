@@ -12,21 +12,17 @@ format, with the depot as node 0 and customers numbered 1..n. No search
 parameter, no acceptance rule and no operator is touched, so the trajectory is
 bit-identical to the unpatched code.
 
+A real unified diff with line numbers, so GNU patch, BSD patch and
+`git apply -p0` all accept it.
+
 Apply with:
     patch -p0 -d external/AILS-II < tools/ails_solution_output.patch
 
 --- src/SearchMethod/AILSII.java
 +++ src/SearchMethod/AILSII.java
-@@
- 	public static void main(String[] args)
- 	{
- 		InputParameters reader=new InputParameters();
- 		reader.readingInput(args);
-
- 		Instance instance=new Instance(reader);
-
+@@ -207,6 +207,27 @@
  		AILSII ailsII=new AILSII(instance,reader);
-
+ 		
  		ailsII.search();
 +
 +		// -solution <file>: write the best solution in CVRPLib .sol format.
@@ -50,3 +46,5 @@ Apply with:
 +			}
 +		}
  	}
+ 	
+ 	public Solution getBestSolution() {

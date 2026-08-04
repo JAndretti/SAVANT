@@ -8,6 +8,20 @@ all: cw
 cw: src/cw.c
 	$(CC) $(CFLAGS) $(OMP) -o $@ $< $(LDFLAGS)
 
+# Portable entry point: pick whichever of the three below this machine can
+# actually do, by trying to compile rather than by guessing from `uname`.
+# GCC and LLVM clang take a bare -fopenmp; Apple clang does not and needs
+# Homebrew's libomp (the macos target); failing both, build single-threaded.
+auto:
+	@if $(CC) $(CFLAGS) $(OMP) -o cw src/cw.c $(LDFLAGS) 2>/dev/null; then \
+	     echo "  OpenMP: $(CC) $(OMP)  -> parallel"; \
+	 elif $(MAKE) --no-print-directory macos >/dev/null 2>&1; then \
+	     echo "  OpenMP: Apple clang + libomp  -> parallel"; \
+	 else \
+	     $(MAKE) --no-print-directory serial; \
+	     echo "  OpenMP: unavailable  -> single-threaded (--threads is a no-op)"; \
+	 fi
+
 # bit-reproducible build: disables FMA contraction, whose application depends
 # on the compiler and on the shape of the code. Costs ~20 % at small n.
 repro: src/cw.c
@@ -41,4 +55,4 @@ debug: src/cw.c
 clean:
 	rm -f cw cw_dbg cw_trace
 
-.PHONY: all repro macos serial trace debug clean
+.PHONY: all auto repro macos serial trace debug clean

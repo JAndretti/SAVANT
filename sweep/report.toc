@@ -1,0 +1,20 @@
+\contentsline {section}{\numberline {1}Overview: what each knob is worth}{3}{section.1}%
+\contentsline {section}{\numberline {2}Does any of this survive a 100$\times $ larger budget?}{4}{section.2}%
+\contentsline {section}{\numberline {3}Initialisation: where the annealing starts from}{6}{section.3}%
+\contentsline {section}{\numberline {4}Move operators}{9}{section.4}%
+\contentsline {section}{\numberline {5}swap* and route opening}{12}{section.5}%
+\contentsline {section}{\numberline {6}Candidate neighbourhood}{15}{section.6}%
+\contentsline {section}{\numberline {7}Compute cost}{16}{section.7}%
+\contentsline {section}{\numberline {8}Restarts}{18}{section.8}%
+\contentsline {section}{\numberline {9}Optimal Split}{20}{section.9}%
+\contentsline {section}{\numberline {10}Vertex selection}{22}{section.10}%
+\contentsline {section}{\numberline {11}Biasing the second vertex}{25}{section.11}%
+\contentsline {section}{\numberline {12}Racing between restarts, and interleaving}{28}{section.12}%
+\contentsline {section}{\numberline {13}Annealing schedule}{31}{section.13}%
+\contentsline {section}{\numberline {14}Construction quality}{33}{section.14}%
+\contentsline {section}{\numberline {15}Do the knobs combine?}{36}{section.15}%
+\contentsline {section}{\numberline {16}The configuration to use}{38}{section.16}%
+\contentsline {subsection}{\numberline {16.1}The command}{39}{subsection.16.1}%
+\contentsline {subsection}{\numberline {16.2}What the changed options do}{40}{subsection.16.2}%
+\contentsline {subsection}{\numberline {16.3}Confirmation}{40}{subsection.16.3}%
+\contentsline {section}{\numberline {17}Caveats}{41}{section.17}%

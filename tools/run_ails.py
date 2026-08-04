@@ -49,6 +49,7 @@ import argparse
 import concurrent.futures as cf
 import csv
 import datetime as _dt
+import glob
 import hashlib
 import json
 import math
@@ -72,13 +73,32 @@ from bundle_to_vrp import read_bundle, write_vrp, instance_name  # noqa: E402
 
 
 def find_java(explicit):
+    """A java launcher, wherever this machine keeps one.
+
+    external/jdk is checked first: that is where setup.sh drops a JDK when the
+    system has none and there is no root to install one. After that, $JAVA_HOME,
+    PATH, then the usual per-platform locations — Homebrew on macOS,
+    /usr/lib/jvm on Debian/Ubuntu/Fedora, /usr/java on RHEL.
+    """
     if explicit:
         return explicit
-    for cand in ("/opt/homebrew/opt/openjdk/bin/java",
-                 "/usr/local/opt/openjdk/bin/java"):
-        if os.path.exists(cand):
-            return cand
-    return shutil.which("java") or "java"
+    local = os.path.join(ROOT, "external", "jdk", "bin", "java")
+    if os.path.exists(local):
+        return local
+    home = os.environ.get("JAVA_HOME")
+    if home and os.path.exists(os.path.join(home, "bin", "java")):
+        return os.path.join(home, "bin", "java")
+    found = shutil.which("java")
+    if found:
+        return found
+    for pat in ("/opt/homebrew/opt/openjdk*/bin/java",     # macOS, arm64
+                "/usr/local/opt/openjdk*/bin/java",        # macOS, x86_64
+                "/usr/lib/jvm/*/bin/java",                 # Debian, Fedora
+                "/usr/java/*/bin/java"):                   # RHEL
+        cands = sorted(glob.glob(pat))
+        if cands:
+            return cands[-1]
+    return "java"
 
 
 def recompute(routes, xs, ys, ds, cap, n, rounded):
@@ -191,8 +211,10 @@ def main():
     try:
         subprocess.run([java, "-version"], capture_output=True, check=True)
     except (OSError, subprocess.CalledProcessError):
-        ap.error(f"no working java at {java!r} — install one with "
-                 f"`brew install openjdk`, or pass --java")
+        ap.error(f"no working java at {java!r}. Install a JDK "
+                 f"(apt install default-jdk / dnf install java-latest-openjdk-devel / "
+                 f"brew install openjdk), or let `sh tools/setup.sh` drop one in "
+                 f"external/jdk, or pass --java")
 
     if args.indir:
         names = sorted(f[:-4] for f in os.listdir(args.indir)

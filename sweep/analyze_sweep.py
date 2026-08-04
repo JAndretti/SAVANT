@@ -2,28 +2,44 @@
 # -*- coding: utf-8 -*-
 """analyze_sweep.py — analyse the runs produced by sweep/run_sweep.sh.
 
-Reads sweep/results/<study>/<tag>.{meta,log,csv}, rebuilds each run's option
-dict from the recorded command line, and produces:
+Reads sweep/results/<tier>/s<seed>/<study>/<tag>.{meta,log,csv}, rebuilds each
+run's option dict from the recorded command line, and produces:
 
     sweep/figures/*.png     one figure per study + an overview
     sweep/report.tex        the report: what each knob does, the figures,
                             the paired statistics, and the winning command
     sweep/report.pdf        compiled with pdflatex, when it is installed
 
-Every run of a study uses the same (n, m, seed), so instance k is byte-identical
-across runs (cw.c:2574 seeds instance k with seed+k). Comparisons are therefore
-*paired*: we compare cost_i(A) with cost_i(B) on the same instance and report the
-mean of the differences, its 95 % CI, and a distribution-free sign test. That is
-far tighter than comparing two means with independent standard deviations.
+Three things the reader should know about the shape of the data.
+
+*Pairing.* Every run of a study uses the same (n, m, seed), so instance k is
+byte-identical across runs (cw.c:2574 seeds instance k with seed+k). Comparisons
+are therefore *paired*: we compare cost_i(A) with cost_i(B) on the same instance
+and report the mean of the differences, its 95 % CI, and a distribution-free
+sign test. That is far tighter than comparing two means with independent
+standard deviations.
+
+*Seeds.* Each configuration is run at every seed in the sweep's seed list, and
+load() pools them: the per-instance vectors are concatenated in seed order, so
+the pairing above still holds position-by-position while the paired sample grows
+by a factor of len(seeds). cw has one --seed, driving both the instances and the
+annealing RNG (cw.c:2679), so a seed is a full replication and no result here
+rests on a single instance draw.
+
+*Tiers.* The same grids are run at two budgets -- 10^5 steps with m=1000, and
+10^7 with m=200, the budget the solver is actually used at. The body of the
+report is one tier (--tier, default `hi`); budget_shift() puts the two side by
+side and names the knobs whose recommendation does not transfer.
 
 The recommended configuration at the end is *derived*, not hand-picked: a knob
 enters it only if its best setting beat its own default significantly. That
-combination is then re-run, on the sweep seed and on a seed the sweep never saw,
-because tuning knobs one at a time does not make them additive (see the `tuned`
-study, where the naive combination is worse than the defaults).
+combination is then re-run, on the sweep's own seeds and on as many seeds it has
+never seen, because tuning knobs one at a time does not make them additive (see
+the `tuned` study, where the naive combination is worse than the defaults).
 
 Usage:
     uv run sweep/analyze_sweep.py
+    uv run sweep/analyze_sweep.py --tier lo        # report the 10^5 tier instead
     uv run sweep/analyze_sweep.py --no-verify      # skip the confirmation runs
     uv run sweep/analyze_sweep.py --no-pdf         # emit .tex only
 """
@@ -170,18 +186,27 @@ def parse_cmd(cmd: str) -> dict:
 
 class Run:
     __slots__ = ("study", "tag", "opts", "ok", "shell_s", "log", "cost",
-                 "cost_init", "time_ms", "routes_v", "feasible")
+                 "cost_init", "time_ms", "routes_v", "feasible", "seeds")
 
-    def __init__(self, study, tag, opts, ok, shell_s, log, arrays):
+    def __init__(self, study, tag, opts, ok, shell_s, log, arrays, seeds=None):
         self.study, self.tag, self.opts, self.ok = study, tag, opts, ok
         self.shell_s, self.log = shell_s, log
         (self.cost, self.cost_init, self.time_ms,
          self.routes_v, self.feasible) = arrays
+        self.seeds = tuple(seeds) if seeds is not None else (opts["seed"],)
 
-    # instances are identical iff (n, m, seed) match -> pairing key
+    # Instances are identical iff (n, m, seeds) match -> pairing key. The seed
+    # tuple is part of it because a pooled run concatenates one block per seed:
+    # two runs are only comparable position-by-position if they pooled the same
+    # seeds in the same order, so a configuration that failed on one seed is
+    # refused by paired() rather than silently misaligned.
     @property
     def instkey(self):
-        return (self.opts["n"], self.opts["m"], self.opts["seed"])
+        return (self.opts["n"], self.opts["m"], self.seeds)
+
+    @property
+    def n_seeds(self):
+        return len(self.seeds)
 
     @property
     def mean(self):
@@ -234,16 +259,62 @@ def read_run(base, study, tag_default):
                ffloat(meta.get("wall_s", "nan")), log, arrays)
 
 
+ARRAY_FIELDS = ("cost", "cost_init", "time_ms", "routes_v", "feasible")
+
+
+def pool(study: str, tag: str, per_seed) -> Run:
+    """Merge the per-seed runs of one configuration into a single Run.
+
+    A seed is a full replication: `--seed` drives both the instance set
+    (cw.c:2574) and the annealing RNG (cw.c:2679), so each seed is a fresh draw
+    of instances solved with fresh randomness. Concatenating the per-instance
+    vectors **in seed order** keeps every downstream comparison exactly paired
+    --- instance j of seed s lands at the same offset in every run of the study
+    --- while multiplying the paired sample by the number of seeds. Nothing in
+    the analysis below has to know this happened.
+
+    Scalars read out of the log (wall time, T0, acceptance rate) are averaged
+    instead: each seed measured the same quantity on an equally large sample.
+    """
+    per_seed = sorted(per_seed, key=lambda t: t[0])
+    seeds = [s for s, _ in per_seed]
+    rs = [r for _, r in per_seed]
+    arrays = tuple(np.concatenate([getattr(r, f) for r in rs])
+                   for f in ARRAY_FIELDS)
+    log = {}
+    for key in set().union(*(set(r.log) for r in rs)):
+        vals = [r.log[key] for r in rs if key in r.log]
+        log[key] = sum(vals) / len(vals)
+    shell = [r.shell_s for r in rs if not math.isnan(r.shell_s)]
+    return Run(study, tag, dict(rs[0].opts), True,
+               sum(shell) / len(shell) if shell else float("nan"),
+               log, arrays, seeds=seeds)
+
+
 def load(results_dir: str) -> list[Run]:
-    runs = []
-    for study in sorted(os.listdir(results_dir)):
-        sdir = os.path.join(results_dir, study)
-        if not os.path.isdir(sdir):
+    """All runs of one tier, pooled over the seeds.
+
+    Layout is <results_dir>/s<seed>/<study>/<tag>.{meta,log,csv}. Runs sharing
+    (study, tag) across seed directories are one configuration replicated, and
+    are pooled by pool() above.
+    """
+    groups = defaultdict(list)
+    for sd in sorted(os.listdir(results_dir)):
+        if not (sd.startswith("s") and sd[1:].isdigit()):
             continue
-        for fn in sorted(os.listdir(sdir)):
-            if fn.endswith(".meta"):
-                runs.append(read_run(os.path.join(sdir, fn[:-5]), study, fn[:-5]))
-    return [r for r in runs if r.ok]
+        seed = int(sd[1:])
+        sroot = os.path.join(results_dir, sd)
+        for study in sorted(os.listdir(sroot)):
+            sdir = os.path.join(sroot, study)
+            if not os.path.isdir(sdir):
+                continue
+            for fn in sorted(os.listdir(sdir)):
+                if not fn.endswith(".meta"):
+                    continue
+                r = read_run(os.path.join(sdir, fn[:-5]), study, fn[:-5])
+                if r.ok:
+                    groups[(study, r.tag)].append((seed, r))
+    return [pool(st, tg, v) for (st, tg), v in sorted(groups.items())]
 
 
 # ------------------------------------------------------------ statistics
@@ -528,6 +599,11 @@ Does the annealing erase that, and how much budget does it cost to do so?
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.2))
     ax = axes[0]
     rows = []
+    # The ladder is a set of multiples of the tier's budget, so its ends move
+    # with the tier: 10^3..10^6 at `lo`, 10^5..10^7 at `hi`. Read them off the
+    # data so the table headers and the "not within" cell stay true.
+    ladder = sorted({r.opts["sa-steps"] for r in sel(runs, "init")})
+    s_min, s_max = (ladder[0], ladder[-1]) if ladder else (0, 0)
     for k, n in enumerate(ns):
         cw = {r.opts["sa-steps"]: r for r in sel(runs, "init", n=n, init="cw")}
         rd = {r.opts["sa-steps"]: r for r in sel(runs, "init", n=n, init="random")}
@@ -540,7 +616,8 @@ Does the annealing erase that, and how much budget does it cost to do so?
         ax.fill_between(steps, lo, hi, color=CAT[k], alpha=0.15, linewidth=0)
         hit = next((s for s, h in zip(steps, hi) if h <= 0), None)
         rows.append([n, "%+.2f" % pct[0], "%+.2f" % pct[-1],
-                     ("%s" % f"{hit:,}") if hit else "not within $10^6$"])
+                     ("%s" % f"{hit:,}") if hit
+                     else "not within %s" % f"{s_max:,}"])
     ax.axhline(0, color=INK3, lw=1.0)
     ax.set_xscale("log")
     ax.set_xlabel("SA steps")
@@ -584,7 +661,8 @@ Does the annealing erase that, and how much budget does it cost to do so?
             "equal budget, with a 95\\,\\% band. Right: how many steps the random "
             "start needs to reach what Clarke \\& Wright reaches at $S$ steps.")
 
-    doc.table([r"$n$", r"excess at $10^3$ (\%)", r"excess at $10^6$ (\%)",
+    doc.table([r"$n$", r"excess at %s (\%%)" % f"{s_min:,}",
+               r"excess at %s (\%%)" % f"{s_max:,}",
                "steps to catch up"], rows,
               "Penalty for a random start, paired against the C\\&W start at the "
               "same budget. `Catch up' is the first budget at which the upper end "
@@ -593,12 +671,27 @@ Does the annealing erase that, and how much budget does it cost to do so?
               "Budget multiplier: steps the random start needs to match the C\\&W "
               "start, relative to the C\\&W budget. A ratio of 1 means the head "
               "start has been fully repaid.", align="rrrr")
+    # The closing claim is checked, not asserted: "never overtakes" means no
+    # (n, budget) cell where the random start is significantly *better*.
+    over = [(r.opts["n"], r.opts["sa-steps"])
+            for r in sel(runs, "init", init="random")
+            for c in [next((x for x in sel(runs, "init", n=r.opts["n"], init="cw")
+                            if x.opts["sa-steps"] == r.opts["sa-steps"]), None)]
+            if c for st in [paired(c, r)] if st and st["sig"] and st["pct"] < 0]
+    tail = (r"""It never overtakes --- not one of the %d cells in the grid has the
+random start significantly ahead --- so it buys no diversity the annealing can
+exploit. Keep the construction."""
+            % (len(ns) * len(ladder))) if not over else (
+        r"""It does overtake in %d of the %d cells (%s), which is a genuine
+        exception to the earlier reading and worth following up rather than
+        averaging away."""
+        % (len(over), len(ns) * len(ladder),
+           ", ".join("$n=%d$ at %s steps" % (n, f"{s:,}") for n, s in over[:4])))
     doc.p(r"""
-\textbf{Reading.} The random start converges to parity but never overtakes: it
-buys no extra diversity that the annealing can exploit. The gap closes late and
-costs dearly along the way --- at $n=200$ it still needs several times the budget
-at $10^5$ steps. Keep the construction.
-""")
+\textbf{Reading.} The random start converges towards parity as the budget grows:
+the penalty falls from %s at %s steps to %s at %s. %s
+""" % (rows[0][1] + r"\,\%" if rows else "--", f"{s_min:,}",
+       rows[0][2] + r"\,\%" if rows else "--", f"{s_max:,}", tail))
 
 
 def study_ops(runs, out, doc):
@@ -691,14 +784,29 @@ weighting right, and is or-opt off for a good reason?
                   "Or-opt segment length, with or-opt enabled "
                   "(\\texttt{-{}-ops 1,1,1,1}). Valid range is 2--8 "
                   "(\\texttt{cw.c:2546}).", align="rrrrr")
-    doc.p(r"""
-\textbf{Reading.} The default subset wins: every other subset is worse, and
-turning or-opt on costs a small but significant amount. Or-opt overlaps with
-relocate (a length-1 relocate is the same move) while being more expensive per
-draw, so at a fixed step count it buys less. \texttt{-{}-or-max} is then
-irrelevant --- its whole range sits inside the noise. Leaving or-opt off is the
-right default.
-""")
+    # "The default subset wins" is a claim, so it is checked rather than
+    # asserted: any subset or weighting significantly below the default is
+    # named. Same for "--or-max sits inside the noise".
+    beaters = [(ops_label(r.opts["ops"]), s) for r, s in
+               list(zip(subs, stats)) + [(r, paired(base, r)) for r in ws]
+               if s and s["sig"] and s["pct"] < 0]
+    or_sig = [r.opts["or-max"] for r, s in zip(om, st) if s and s["sig"]] if orows else []
+    doc.p((r"""
+\textbf{Reading.} The default subset wins: every other subset and weighting is
+worse or indistinguishable, and turning or-opt on costs a small but significant
+amount.""" if not beaters else r"""
+\textbf{Reading.} The default subset is \emph{not} the best here: %s beat it
+significantly (best %+.3f\,\%%). That contradicts the same study at the other
+budget and is the single most actionable line in this section.""" % (
+        esc(", ".join(b for b, _ in beaters[:3])),
+        min(s["pct"] for _, s in beaters))) + r"""
+Or-opt overlaps with relocate (a length-1 relocate is the same move) while being
+more expensive per draw, so at a fixed step count it buys less. """ + (
+        r"\texttt{-{}-or-max} is then irrelevant --- its whole range sits inside "
+        r"the noise. Leaving or-opt off is the right default."
+        if not or_sig else
+        r"\texttt{-{}-or-max} does move here, at %s, which it did not at the "
+        r"lower budget." % esc(", ".join(str(v) for v in or_sig))))
 
 
 def study_newops(runs, out, doc):
@@ -861,16 +969,34 @@ terms. Everything below is therefore also measured against wall time.
                   "dimension, at equal step count. The last column is the wall "
                   "time ratio --- the price of the equal-step gain.",
                   align="rrrrrrr")
+    # The two load-bearing claims -- "survives the iso-time yardstick" and
+    # "the weight is insensitive" -- are read back out of the tables above.
+    # the "+ swap*" rung specifically: swap* added, nothing else changed
+    iso_ds = [float(c.replace("\\,\\%", "")) for r in iso_rows
+              if r[0] == esc("+ swap*") for c in (r[4], r[8]) if c != "--"]
+    iso_ok = bool(iso_ds) and max(iso_ds) < 0
+    sst = [(r.opts["ops"], paired(base, r)) for r in rs
+           if r.tag.startswith("sstar_") and paired(base, r)]
+    spread = (max(s["pct"] for _, s in sst) - min(s["pct"] for _, s in sst)) \
+        if sst else float("nan")
+    n100 = next((r for r in rows if r[0] == 100), None)
+    tx = n100[-1] if n100 else "--"
     doc.p(r"""
-\textbf{Reading.} swap* is the largest single improvement in this whole
-document, and --- unlike most of the others --- it survives the change of
-yardstick. It costs about 20\,\% more wall time per step, but the iso-time table
-shows it still ahead by roughly half a percent at both ends of the ladder, so
-the extra work per draw is bought back several times over. Its weight is
-insensitive over the whole range tried: anything from a quarter to four times
-the weight of relocate lands within noise of the same place, which is what one
-wants from a knob.
-""")
+\textbf{Reading.} swap* is %s. It costs %s$\times$ the wall time per step at
+$n=100$, and the iso-time table %s --- %s. Its weight is insensitive over the
+whole range tried: a quarter to four times the weight of relocate spans only
+%.3f\,\%%, which is what one wants from a knob.
+""" % (("the largest single improvement in this document"
+        if sst and min(s["pct"] for _, s in sst) <= min(
+            (k[3]["pct"] for k in knobs(runs)), default=0)
+        else "a clear improvement at equal step count"),
+       tx,
+       ("still shows it ahead" if iso_ok else "does \\emph{not} keep it ahead"),
+       ("so the extra work per draw is bought back" if iso_ok else
+        "so at this budget the equal-step gain is paid for in wall time and "
+        "does not survive the change of yardstick --- the honest reading is "
+        "that swap* is not free here"),
+       spread))
     doc.p(r"""
 Route opening is a different kind of thing. On its own it is worth almost
 nothing, and at large weight it is actively harmful --- unsurprising, since it
@@ -963,12 +1089,28 @@ see Section~\ref{sec:pick}.
               "The effective $K$ is $\\min(K, n-1)$, which is why the rows for "
               "$n=20$ at $K \\ge 20$ are exactly identical runs.",
               align="rrrrrrrrl", long=True)
-    doc.p(r"""
-\textbf{Reading.} $K=20$ is the optimum at every dimension tested, and the curve
-is a clean U: too small a list starves the move of good partners, too large a
-one dilutes it with distant ones that will be rejected. The default needs no
-change --- and notably it does not need to grow with $n$.
-""")
+    # Which K actually wins at each n, so the claim "K=20 everywhere" is read
+    # off the data. At n=20 every K >= 19 is the same run (clamped), so a tie
+    # there is not evidence against the default.
+    winner = {}
+    for n in ns:
+        by = {r.opts["sa-knn"]: r for r in sel(runs, "knn", n=n)}
+        if by:
+            winner[n] = min(by, key=lambda K: by[K].mean)
+    off = {n: K for n, K in winner.items() if min(K, n - 1) != min(20, n - 1)}
+    doc.p((r"""
+\textbf{Reading.} $K=20$ is the optimum at every dimension tested (%s), and the
+curve is a clean U: too small a list starves the move of good partners, too
+large a one dilutes it with distant ones that will be rejected. The default
+needs no change --- and notably it does not need to grow with $n$.
+""" % esc(", ".join("n=%d" % n for n in sorted(winner)))) if not off else (r"""
+\textbf{Reading.} The best $K$ is \emph{not} 20 everywhere at this budget: %s.
+The curve is still a U --- too small a list starves the move of good partners,
+too large a one dilutes it with distant ones that will be rejected --- but its
+minimum has moved, so the default is worth revisiting at this budget. Read the
+paired column before acting: a shifted argmin inside the noise is not a shifted
+optimum.
+""" % esc(", ".join("n=%d prefers K=%s" % (n, K) for n, K in sorted(off.items())))))
 
 
 def study_timing(runs, out, doc):
@@ -1191,16 +1333,38 @@ better to spend them on one long run or several short ones?
                    for l, r in zip(lab, div)],
                   "How restart diversity is produced, at $R=8$, against the "
                   "default \\texttt{perturb} with $\\alpha=0.03$.", align="lrrrr")
+    # This is the knob the two tiers disagree about most, so the paragraph is
+    # written from the iso-budget curve rather than from the previous reading.
+    iso1 = one(runs, "restarts", "iso_R1")
+    budget = iso1.opts["sa-steps"] if iso1 else 0
+    isost = [(r.opts["restarts"], paired(iso1, r)) for r in iso[1:]] if iso else []
+    isost = [(R, s) for R, s in isost if s]
+    bestR, bestS = min(isost, key=lambda t: t[1]["pct"]) if isost else (None, {})
+    anysig = [R for R, s in isost if s["sig"] and s["pct"] < 0]
+    if anysig:
+        head = (r"""At equal budget, splitting the run pays: %d restarts of
+$%s$ steps each beat a single run of $%s$ by $%+.3f\,\%%$, and %s of the %d
+restart counts tried clear significance. The annealing \emph{is} getting stuck
+in a way a fresh start fixes --- so at this budget the whole allowance should
+not go into one long anneal."""
+                % (bestR, f"{budget // bestR:,}".replace(",", "\\,"),
+                   f"{budget:,}".replace(",", "\\,"), bestS["pct"],
+                   len(anysig), len(isost)))
+    else:
+        head = (r"""At equal budget, restarts are flat: splitting $%s$ steps into
+2, 4, \dots, 32 independent anneals changes nothing significant (best
+$%+.3f\,\%%$ at $R=%s$). The annealing is not getting trapped in a way that a
+fresh start would fix, so the whole budget may as well go into one run."""
+                % (f"{budget:,}".replace(",", "\\,"),
+                   bestS.get("pct", float("nan")), bestR))
     doc.p(r"""
-\textbf{Reading.} At equal budget, restarts are flat: splitting $320\,000$ steps
-into 2, 4, \dots, 32 independent anneals changes nothing significant. The
-annealing is not getting trapped in a way that a fresh start would fix, so the
-whole budget may as well go into one run. The random start is the exception ---
-it degrades sharply as its share of the budget shrinks, which is the same result
-as Section~\ref{sec:init} seen from another angle. On diversity, the default \texttt{perturb}
-at $\alpha=0.03$ is the best of the options: too much perturbation
-($\alpha \ge 0.3$) damages every restart, and \texttt{off} is worse still.
-""")
+\textbf{Reading.} %s The random start is the exception --- it degrades sharply as
+its share of the budget shrinks, which is the same result as
+Section~\ref{sec:init} seen from another angle. On diversity, the default
+\texttt{perturb} at $\alpha=0.03$ is the best of the options: too much
+perturbation ($\alpha \ge 0.3$) damages every restart, and \texttt{off} is worse
+still.
+""" % head)
 
 
 def study_split(runs, out, doc):
@@ -1208,9 +1372,12 @@ def study_split(runs, out, doc):
     if not rs:
         return
     modes = ["off", "cw", "end", "both"]
-    evs = [0, 100, 1000, 10000]
     grid = {(r.opts["split"], r.opts["split-every"]): r
             for r in rs if r.tag.startswith("m")}
+    # --split-every is a period in steps, so the sweep scales it with the tier
+    # (STEPS/1000, /100, /10) to hold the *number* of Splits fixed. Read the
+    # periods off the data rather than hardcoding the `lo` values.
+    evs = sorted({e for _, e in grid})
     ref = grid.get(("off", 0))
 
     doc.sec("Optimal Split", "sec:split")
@@ -1241,7 +1408,8 @@ chooses how the giant tour is built: routes in their current order,
     if tours and ref:
         bar_delta(ax, [r.opts["split-tour"] for r in tours],
                   [paired(ref, r) for r in tours],
-                  "--split-tour (with --split both --split-every 1000)",
+                  "--split-tour (with --split both --split-every %d)"
+                  % (tours[0].opts["split-every"]),
                   "Δ vs no Split (%)")
 
     ax = axes[2]
@@ -1249,7 +1417,10 @@ chooses how the giant tour is built: routes in their current order,
     if big:
         bns = sorted({r.opts["n"] for r in big})
         w = 0.35
-        for k, e in enumerate((0, 1000)):
+        # the two periods the large-n block was run at: never, and the study's
+        # middle period (STEPS/100), whatever the tier made that
+        big_evs = sorted({r.opts["split-every"] for r in big})[:2]
+        for k, e in enumerate(big_evs):
             vals = []
             for n in bns:
                 b = [r for r in big if r.opts["n"] == n and r.opts["split"] == "off"
@@ -1292,16 +1463,41 @@ chooses how the giant tour is built: routes in their current order,
                   "Split internally --- note it is large where the paired delta "
                   "is not, i.e.\\ Split keeps recovering cost the annealing had "
                   "just spent.", align="llrrrrrr", long=True)
-    doc.p(r"""
-\textbf{Reading.} Split never hurts --- \texttt{-{}-split end} improves 53
-instances and worsens exactly zero, which is the theoretical guarantee showing up
-in the data --- but on this instance family it barely helps either: the best cell
-is about $-0.02\,\%$, inside the noise. Its internal `gain' counter is large
-while the net effect is nil, meaning it mostly undoes damage the annealing did
-rather than finding new structure. Applying it every 100 steps is actively bad:
-it costs double the wall time and drags the search back to a repartitioned
-solution before the annealing can exploit its own moves.
-""")
+    if ref:
+        # Every number in the paragraph below is read back out of the grid, so
+        # it cannot drift from the table above it when the tier or the seed set
+        # changes. `end` is the pure-guarantee cell: Split applied once, after
+        # the annealing, where the theory says the result can never be worse.
+        endr = grid.get(("end", 0))
+        s_end = paired(ref, endr) if endr else {}
+        cells = [(m, e, paired(ref, grid[(m, e)]))
+                 for (m, e) in grid if (m, e) != ("off", 0)]
+        cells = [c for c in cells if c[2]]
+        bm, be, bs = min(cells, key=lambda c: c[2]["pct"]) if cells else (None, None, {})
+        # the shortest period tried, i.e. the most aggressive setting
+        fast = min((e for _, e in grid if e), default=0)
+        fast_cells = [paired(ref, grid[(m, fast)]) for m in modes
+                      if (m, fast) in grid and paired(ref, grid[(m, fast)])]
+        fast_worst = max((c["pct"] for c in fast_cells), default=float("nan"))
+        w_ref = ref.log.get("wall_s", float("nan"))
+        w_fast = np.nanmean([grid[(m, fast)].log.get("wall_s", np.nan)
+                             for m in modes if (m, fast) in grid]) if fast else float("nan")
+        doc.p(r"""
+\textbf{Reading.} Split never hurts: \texttt{-{}-split end} --- one Split, after
+the annealing --- improves %d instances and worsens %d, which is the theoretical
+guarantee showing up in the data. But on this instance family it barely helps
+either: the best cell in the whole grid is \texttt{%s} + %s at $%+.3f\,\%%$. Its
+internal `gain' counter is large while the net effect is small, meaning it mostly
+undoes damage the annealing did rather than finding new structure. Applying it
+every %s steps --- the most aggressive period tried --- costs %.1f$\times$ the
+wall time (%.2f\,s against %.2f\,s) and is worth at worst $%+.3f\,\%%$: it drags
+the search back to a repartitioned solution before the annealing can exploit its
+own moves.
+""" % (s_end.get("wins", 0), s_end.get("losses", 0),
+       bm or "--", ("never" if not be else "every %s" % f"{be:,}"),
+       bs.get("pct", float("nan")),
+       f"{fast:,}", (w_fast / w_ref) if w_ref else float("nan"),
+       w_fast, w_ref, fast_worst))
 
 
 def study_pick(runs, out, doc):
@@ -1427,16 +1623,31 @@ specifically to test that prediction.
                   "exactly zero because \\texttt{cw.c:1676} forces uniform "
                   "selection there --- while the run header still prints the "
                   "requested rule.", align="rrrrrr")
-    doc.p(r"""
-\textbf{Reading.} The prediction was wrong. At $n=100$ with $10^5$ steps the
-entire grid --- every tournament size, every criterion, and the Fenwick sampler
---- sits inside $\pm 0.08\,\%$ of the default. The regret machinery is
-measurable in the code but not in the result: whatever it saves in draw quality
-it appears to give back in draw cost. It is only at $T \ge 16$ with \texttt{lb}
-or \texttt{raw} that the choice starts to hurt, from over-concentrating on a few
-vertices. The one solid finding here is the silent fallback at $K=0$: the header
-reports a rule the code is not using.
-""")
+    if ref:
+        # Span of the whole grid, so the "nothing here moves" claim is measured
+        # rather than asserted, and the worst cell is named by the data.
+        gs = {(t, c): paired(ref, grid[(t, c)]) for (t, c) in grid
+              if paired(ref, grid[(t, c)])}
+        span = max((abs(s["pct"]) for s in gs.values()), default=float("nan"))
+        nsig = sum(1 for s in gs.values() if s["sig"])
+        (wt, wc), ws = max(gs.items(), key=lambda kv: kv[1]["pct"]) \
+            if gs else ((None, None), {})
+        (bt, bc), bs2 = min(gs.items(), key=lambda kv: kv[1]["pct"]) \
+            if gs else ((None, None), {})
+        doc.p(r"""
+\textbf{Reading.} At $n=100$ with $%s$ steps the entire grid --- every tournament
+size, every criterion, and the Fenwick sampler --- sits inside
+$\pm %.3f\,\%%$ of the default, and %s of the %d cells clears significance. The
+regret machinery is measurable in the code but not, at this budget, in the
+result: whatever it saves in draw quality it appears to give back in draw cost.
+The worst cell is $T=%s$ with \texttt{%s} at $%+.3f\,\%%$, from over-concentrating
+on a few vertices; the best is $T=%s$ with \texttt{%s} at $%+.3f\,\%%$. The one
+unambiguous finding here is the silent fallback at $K=0$: the header reports a
+rule the code is not using.
+""" % (f"{tier_steps(runs):,}".replace(",", "\\,"), span,
+       ("none" if nsig == 0 else str(nsig)), len(gs),
+       wt, wc, ws.get("pct", float("nan")),
+       bt, bc, bs2.get("pct", float("nan"))))
 
 
 def study_select(runs, out, doc):
@@ -1562,17 +1773,33 @@ only testable on the grid, so the grid is what is run.
         doc.table([r"$n$", "default", "vrank 2, K=30", *DHEAD], dim_rows,
                   "The rank bias with the longer candidate list, across "
                   "dimension.", align="rrrrrr")
-    doc.p(r"""
+    # "The best cell is the default corner" and "vrank 2 + K=30 is among the
+    # worst" are both checkable, so they are checked. If the grid ever comes
+    # out the other way the paragraph has to say so.
+    cells = {(v, K): x for v in vs for K in Ks
+             for x in [next((y for y in rs if y.tag == f"vrank{v}_K{K}"), None)] if x}
+    ranked = sorted(cells, key=lambda k: cells[k].mean)
+    best_cell = ranked[0] if ranked else None
+    claim_pair = (2, 30)
+    pair_rank = (ranked.index(claim_pair) + 1) if claim_pair in ranked else None
+    default_wins = best_cell == (1, 20)
+    doc.p((r"""
 \textbf{Reading.} The coupling claim does not reproduce here, and the heat map
 is unusually unambiguous about it: the best cell of the whole grid is the
-default corner, every increase in \texttt{-{}-vrank} makes things worse at every
-$K$, and the effect compounds --- the supposed winning combination, a longer
-list with a stronger rank bias, is among the worst cells tried. The most likely
-explanation is that the claim was made against a construction that shares one
-$K=30$ neighbour list between the savings and the annealing, whereas here the
-savings are exact for $n \le 1500$ and the annealing builds its own list. Those
-are not the same baseline, and this sweep cannot settle which is right for the
-other one --- only that on this code, at this budget, the rank bias costs.
+default corner \texttt{vrank 1, K=20}, and the supposed winning combination
+\texttt{vrank 2, K=30} ranks %s of %s cells tried.""" % (pair_rank, len(ranked))
+           if default_wins else r"""
+\textbf{Reading.} The best cell of the grid is \texttt{vrank %d, K=%d}, not the
+default corner --- so at this budget the coupling claim is \emph{not} simply
+refuted, and \texttt{vrank 2, K=30} ranks %s of %s. Read the paired column
+before acting on it: an argmin that moves inside the noise is not a result.""" %
+           (best_cell[0], best_cell[1], pair_rank, len(ranked))) + r"""
+The most likely explanation for the disagreement with the source is that the
+claim was made against a construction that shares one $K=30$ neighbour list
+between the savings and the annealing, whereas here the savings are exact for
+$n \le 1500$ and the annealing builds its own list. Those are not the same
+baseline, and this sweep cannot settle which is right for the other one --- only
+what happens on this code at this budget.
 """)
     doc.p(r"""
 \texttt{-{}-pick2} is the mild surprise: a tournament of 3 on the partner is a
@@ -1706,12 +1933,25 @@ unequal budget would be meaningless.
                   "Interleaving. The \\emph{identical} column is the check that "
                   "this is an engineering change and not an algorithmic one: "
                   "the two costs must agree exactly.", align="rrrlrrr")
+    # "the gain grows with the restart count" is the load-bearing claim, and
+    # rrows already holds it: read the first and last rung rather than assert.
+    grow = ""
+    if len(rrows) >= 2:
+        def pct_of(row):
+            try:
+                return float(str(row[3]).replace(r"\textbf{", "").replace("}", ""))
+            except ValueError:
+                return float("nan")
+        first, last = pct_of(rrows[0]), pct_of(rrows[-1])
+        if np.isfinite(first) and np.isfinite(last):
+            grow = (r"""with %s starts it is worth $%+.3f\,\%%$ and with %s
+$%+.3f\,\%%$, so the gain %s with the restart count"""
+                    % (rrows[0][0], first, rrows[-1][0], last,
+                       "grows" if last < first else "does \\emph{not} grow"))
     doc.p(r"""
-\textbf{Reading.} Racing needs starts to race: with two it has almost nothing to
-redistribute, and the gain grows steadily with the restart count. It is the
-second largest effect in this document after swap*, and it costs nothing --- the
+\textbf{Reading.} Racing needs starts to race: %s. It costs nothing --- the
 budget is the same, only its allocation changes.
-""")
+""" % (grow or "the gain is read off the table above"))
     doc.p(r"""
 The margin behaves monotonically over the range tried, which is worth noting
 because it was not the expectation: the tightest margin is the best one, and
@@ -1795,16 +2035,31 @@ schedule; \texttt{-{}-t0} and \texttt{-{}-tend} override the calibration.
                   "Annealing schedule, paired against the default "
                   "($\\texttt{t-accept}=10^{-3}$, 2 decades).",
                   align="rrrrrrr", long=True)
-    doc.p(r"""
-\textbf{Reading.} This is the largest effect in the whole sweep. Narrowing the
-temperature range to a single decade is worth about $-0.37\,\%$ --- more than
-every operator, neighbourhood and selection setting combined. The interpretation
-is that at $10^5$ steps the default schedule spends too long at temperatures so
-low that nothing is accepted: the run is effectively over before the step budget
-is. Fewer decades keeps the search alive for more of the run. This also implies
-the right number of decades depends on the budget, so it should be re-checked
-when \texttt{-{}-sa-steps} changes substantially.
-""")
+    # The whole point of the `hi` tier is that this knob is budget-coupled: the
+    # cooling ratio is (Tend/T0)^(1/(S-1)), so the same decade count is traversed
+    # 100x more slowly. Name the winning cell from the data, not from memory.
+    if ref:
+        cells = {(a, d): paired(ref, grid[(a, d)])
+                 for a in As for d in Ds if (a, d) in grid}
+        cells = {k: v for k, v in cells.items() if v}
+        (ba, bd), bs = min(cells.items(), key=lambda kv: kv[1]["pct"]) \
+            if cells else ((None, None), {})
+        acc = grid[(ba, bd)].log.get("accept_pct", float("nan")) \
+            if (ba, bd) in grid else float("nan")
+        doc.p(r"""
+\textbf{Reading.} The best cell at this budget is
+$\texttt{-{}-t-accept}=%g$ with %s, worth $%+.3f\,\%%$ against the
+default, and it realises a %.2f\,\%% acceptance rate. The mechanism is that a
+schedule spanning too many decades spends the tail of the run at temperatures so
+low that nothing is accepted --- the search is effectively over before the step
+budget is --- while too few leaves it still hot at the end. Where that trade-off
+lands is a function of the budget: the geometric ratio is
+$(T_\mathrm{end}/T_0)^{1/(S-1)}$, so at $S=10^7$ the same decade count is
+traversed a hundred times more slowly than at $10^5$. Section~\ref{sec:budget}
+reports whether the two budgets agree here; if they do not, this is the knob to
+re-measure whenever \texttt{-{}-sa-steps} changes substantially.
+""" % (ba, ("1 decade" if bd == 1 else "%s decades" % bd),
+       bs.get("pct", float("nan")), acc))
 
 
 def study_construct(runs, out, doc):
@@ -1896,14 +2151,31 @@ grid is run twice: with \texttt{-{}-no-sa} and with the full budget.
                          *stat_cells(paired(off, on))])
     doc.table(["stage", r"without \texttt{-{}-2opt}", r"with \texttt{-{}-2opt}", *DHEAD],
               rows, "Intra-route 2-opt after the construction.", align="lrrrrr")
+    # Both halves of this reading are measured: the best (lambda, mu) after
+    # annealing, and what a K=5 savings list costs before and after it.
+    sa_ref = one(runs, "construct", "sa_l1.0_m0")
+    sa_all = [(r, paired(sa_ref, r)) for r in sel(runs, "construct")
+              if r.tag.startswith("sa_l")]
+    sa_all = [(r, s) for r, s in sa_all if s]
+    bshape, bshape_s = min(sa_all, key=lambda t: t[1]["pct"]) if sa_all else (None, {})
+    k5_nosa = one(runs, "construct", "nosa_n200_knn5")
+    k5_sa = one(runs, "construct", "sa_n200_knn5")
+    ex_nosa = one(runs, "construct", "nosa_n200_exact")
+    ex_sa = one(runs, "construct", "sa_n200_exact")
+    s_nosa = paired(ex_nosa, k5_nosa) if (ex_nosa and k5_nosa) else {}
+    s_sa = paired(ex_sa, k5_sa) if (ex_sa and k5_sa) else {}
     doc.p(r"""
 \textbf{Reading.} Two opposite lessons. The savings \emph{shape} matters and
-survives: $\lambda = 1.2$--$1.4$ with $\mu \approx 0.2$--$0.5$ is worth about
-$-0.29\,\%$ after annealing, second only to the schedule. The savings
-\emph{list}, by contrast, does not survive at all: truncating it to the 5 nearest
-neighbours costs $+7.7\,\%$ on the raw construction and essentially nothing once
-the annealing has run. That is a useful lever for large $n$, where
-Section~\ref{sec:timing} showed the $O(n^2)$ list is the dominant cost --- the annealing repairs
+survives the annealing: the best cell after SA is
+$\lambda=%g$, $\mu=%g$, worth $%+.3f\,\%%$ against $\lambda=1$, $\mu=0$. The
+savings \emph{list}, by contrast, does not survive at all: truncating it to the
+5 nearest neighbours costs $%+.2f\,\%%$ on the raw construction and
+$%+.3f\,\%%$ once the annealing has run. That is a useful lever for large $n$, where
+Section~\ref{sec:timing} showed the $O(n^2)$ list is the dominant cost --- the annealing repairs""" % (
+        bshape.opts["lambda"] if bshape else float("nan"),
+        bshape.opts["mu"] if bshape else float("nan"),
+        bshape_s.get("pct", float("nan")),
+        s_nosa.get("pct", float("nan")), s_sa.get("pct", float("nan"))) + r"""
 what the truncation breaks. \texttt{-{}-2opt} is likewise absorbed: it improves
 the construction and changes nothing afterwards.
 """)
@@ -1913,9 +2185,11 @@ def study_tuned(runs, out, doc):
     rs = sel(runs, "tuned")
     if not rs:
         return
-    ns = sorted({r.opts["n"] for r in rs})
+    ns = sorted({r.opts["n"] for r in rs if "_x3_" not in r.tag})
+    sp = next((r.opts["split-every"] for r in rs if r.tag.endswith("_split")), 0)
     variants = [("oropt", "or-opt enabled"), ("critrem", "pick-crit rem"),
-                ("split", "Split both + every 1000"), ("all", "the three combined"),
+                ("split", "Split both + every %s" % f"{sp:,}"),
+                ("all", "the three combined"),
                 ("all_r8", "the three, over 8 restarts")]
 
     doc.sec("Do the knobs combine?", "sec:tuned")
@@ -1957,10 +2231,42 @@ defaults. \texttt{all\_r8} additionally splits the same budget over 8 restarts.
                          "equal SA budget, with 95\\,\\% CIs.")
     doc.table([r"$n$", "variant", "mean cost", *DHEAD, "wall (s)"], rows,
               "Combinations against the stock defaults.", align="rlrrrrr", long=True)
-    doc.p(r"""
+    # The 3x rung, when the tier ran it: is the default-vs-tuned ordering still
+    # moving at the top of the budget range, or has it settled?
+    x3 = []
+    for n in ns:
+        b = one(runs, "tuned", f"n{n}_x3_default")
+        t = one(runs, "tuned", f"n{n}_x3_newall")
+        b1 = one(runs, "tuned", f"n{n}_default")
+        t1 = one(runs, "tuned", f"n{n}_newall")
+        s3, s1 = paired(b, t) if (b and t) else {}, paired(b1, t1) if (b1 and t1) else {}
+        if s3 and s1:
+            x3.append([n, "%.5f" % b.mean, "%.5f" % t.mean, *stat_cells(s3),
+                       "%+.3f" % s1["pct"]])
+    if x3:
+        steps1 = one(runs, "tuned", f"n{ns[0]}_default").opts["sa-steps"]
+        doc.table([r"$n$", "default", r"\texttt{newall}", *DHEAD,
+                   r"$\Delta$ at $1\times$ (\%)"], x3,
+                  "The $3\\times$ rung ($%s$ steps): the same comparison at three "
+                  "times the tier's budget, with the $1\\times$ delta beside it. "
+                  "If the two columns agree, the ordering has settled; if the "
+                  "$3\\times$ delta is still shrinking, the budget has not yet "
+                  "stopped mattering." % f"{3 * steps1:,}", align="rrrrrrr")
+
+    # "the combination is worse than its parts" is a claim about `all`; check it
+    alls = [(n, paired(one(runs, "tuned", f"n{n}_default"),
+                       one(runs, "tuned", f"n{n}_all"))) for n in ns]
+    alls = [(n, s) for n, s in alls if s]
+    worse = [n for n, s in alls if s["pct"] > 0]
+    doc.p((r"""
 \textbf{Reading.} The combination is worse than its parts: \texttt{all} loses to
-the defaults at every $n$, even though one of its three ingredients helps on its
-own. Gains found one knob at a time do not add up, which is exactly why the
+the defaults at every $n$ tested (%s), even though one of its three ingredients
+helps on its own.""" % esc(", ".join("n=%d" % n for n in worse))
+           if len(worse) == len(alls) and alls else r"""
+\textbf{Reading.} The combination loses to the defaults at %s of the %d
+dimensions tested, so at this budget the naive stacking is not uniformly bad ---
+but it is not uniformly good either.""" % (len(worse), len(alls))) + r"""
+Gains found one knob at a time do not add up, which is exactly why the
 recommendation in Section~\ref{sec:best} is confirmed by re-running it rather
 than assembled on paper.
 """)
@@ -1986,6 +2292,28 @@ KNOB_KEYS = {
     "relocate side": ["reloc-side"],
     "racing": ["race", "race-at"],
 }
+
+
+def tier_steps(runs, default=100000):
+    """The tier's own SA budget, read off its `tuned` baseline.
+
+    Nothing in the analysis may hardcode a step count any more: the same study
+    is run at 10^5 and at 10^7, and a comparison that picked the literal 10^5
+    rung would silently find nothing in the `hi` tier.
+    """
+    t = one(runs, "tuned", "n100_default")
+    if t is not None:
+        return t.opts["sa-steps"]
+    return default
+
+
+def tier_label(runs):
+    """A short human label for the tier, e.g. '10^7 steps, m=200'."""
+    t = one(runs, "tuned", "n100_default")
+    if t is None:
+        return "?"
+    return r"$10^{%d}$ steps, $m=%d\times%d$" % (
+        round(math.log10(max(1, t.opts["sa-steps"]))), t.opts["m"], t.n_seeds)
 
 
 def knobs(runs):
@@ -2019,11 +2347,15 @@ def knobs(runs):
         [r for r in sel(runs, "restarts") if r.tag.startswith("iso_")])
     add("savings shape", one(runs, "construct", "sa_l1.0_m0"),
         [r for r in sel(runs, "construct") if r.tag.startswith("sa_l")])
+    # The init ladder spans three decades, so its knob row has to be read at
+    # one rung. That rung is the tier's own budget, not a literal 10^5: the
+    # `hi` tier reruns the same ladder 100x higher up.
+    steps = tier_steps(runs)
     add("initialisation", next((r for r in sel(runs, "init")
                                 if r.opts["n"] == 100 and r.opts["init"] == "cw"
-                                and r.opts["sa-steps"] == 100000), None),
+                                and r.opts["sa-steps"] == steps), None),
         [r for r in sel(runs, "init")
-         if r.opts["n"] == 100 and r.opts["sa-steps"] == 100000])
+         if r.opts["n"] == 100 and r.opts["sa-steps"] == steps])
 
     # --- knobs added with swap*, the selection biases and racing ---
     # Baseline for the newops study is its own ladder rung at the default
@@ -2079,6 +2411,107 @@ Section~\ref{sec:best} re-runs the winners on a seed the sweep never saw.
               [[esc(l), tt(b.tag), *stat_cells(s)] for l, _, b, s in items],
               "Each knob at its best setting, paired against its own default.",
               align="llrrr")
+
+
+# ------------------------------------------------------- budget dependence
+def budget_shift(lo_runs, hi_runs, out, doc):
+    """Does a knob's recommendation survive a 100x larger budget?
+
+    Every knob is measured twice, at the two tiers, and the two answers are put
+    side by side. This is the one section that cannot be produced from a single
+    tier, and it is the reason the sweep runs two.
+    """
+    if not lo_runs or not hi_runs:
+        return
+    lo, hi = knobs(lo_runs), knobs(hi_runs)
+    lo_by = {l: (b, s) for l, _, b, s in lo}
+    hi_by = {l: (b, s) for l, _, b, s in hi}
+    shared = [l for l, _, _, _ in hi if l in lo_by]
+    if not shared:
+        return
+
+    lo_steps, hi_steps = tier_steps(lo_runs), tier_steps(hi_runs)
+
+    rows, flips = [], []
+    for l in shared:
+        lb, ls = lo_by[l]
+        hb, hs = hi_by[l]
+        # A "flip" is a change in the operational answer, not in the point
+        # estimate: the knob was worth turning at one budget and is not at the
+        # other, or the winning setting itself moved.
+        verdict = ""
+        if ls["sig"] != hs["sig"]:
+            verdict = "significant only at %s" % ("$10^5$" if ls["sig"] else "$10^7$")
+            flips.append(l)
+        elif ls["sig"] and hs["sig"] and lb.tag != hb.tag:
+            verdict = "same knob, different setting"
+            flips.append(l)
+        elif not ls["sig"] and not hs["sig"]:
+            verdict = "inert at both"
+        else:
+            verdict = "stable"
+        def cell(st):
+            d = "%+.3f" % st["pct"]
+            return (r"\textbf{%s}" % d if st["sig"] else d,
+                    "[%+.3f,\\;%+.3f]" % (st["pct_lo"], st["pct_hi"]))
+
+        rows.append([esc(l), tt(lb.tag), *cell(ls),
+                     tt(hb.tag), *cell(hs), verdict])
+
+    fig, ax = plt.subplots(figsize=(9, 0.42 * len(shared) + 2.0))
+    y = np.arange(len(shared))
+    ax.barh(y - 0.19, [lo_by[l][1]["pct"] for l in shared], height=0.36,
+            color=CAT[0], label=r"$10^5$ steps, $m=1000\times5$")
+    ax.barh(y + 0.19, [hi_by[l][1]["pct"] for l in shared], height=0.36,
+            color=CAT[1], label=r"$10^7$ steps, $m=200\times5$")
+    ax.set_yticks(y)
+    ax.set_yticklabels(shared)
+    ax.invert_yaxis()
+    ax.axvline(0, color=INK3, lw=1)
+    ax.set_xlabel("best achievable Δ mean cost vs default (%)")
+    ax.set_title("What each knob is worth, at two budgets 100× apart")
+    # every bar extends left from 0, so the lower-left corner is the only
+    # reliably empty region
+    ax.legend(loc="lower left")
+    style(ax, ygrid=False, xgrid=True)
+    fig.tight_layout()
+    savefig(fig, out, "budget_shift.png")
+
+    doc.sec("Does any of this survive a 100$\\times$ larger budget?",
+            "sec:budget")
+    doc.p(r"""
+Every grid in this report is run twice: once at $\texttt{-{}-sa-steps} = %s$ with
+%s instances per seed, and once at $%s$ with %s. A knob tuned at the lower budget
+is only useful if its answer still holds at the higher one, which is where this
+solver is actually run --- and that is not something a single-budget sweep can
+check. The two columns below are the same measurement at the two budgets.
+""" % (f"{lo_steps:,}", "1000", f"{hi_steps:,}", "200"))
+    doc.fig("budget_shift.png",
+            "Each knob's best achievable improvement, measured independently at "
+            "the two budgets. A bar pair that changes sign or magnitude is a "
+            "recommendation that does not transfer.")
+    doc.table(["knob", r"best @ $10^5$", r"$\Delta$ (\%)", r"95\,\% CI",
+               r"best @ $10^7$", r"$\Delta$ (\%)", r"95\,\% CI", "verdict"], rows,
+              "Each knob at each budget, with both intervals --- they are not "
+              "equally precise, since $m$ is 1000 per seed at $10^5$ and 200 at "
+              "$10^7$. \\emph{stable} means the same setting won and stayed "
+              "significant; \\emph{inert at both} means the knob never earned a "
+              "change. Anything else is a recommendation that depends on the "
+              "budget.", align="llrrlrrl", long=True)
+    if flips:
+        doc.note(r"""
+\textbf{%d of %d knobs do not transfer:} %s. For these the setting recommended
+in Section~\ref{sec:best} is the one measured at $10^7$ steps, because that is
+the budget this solver is run at; the $10^5$ column is kept only to show that
+the disagreement exists.
+""" % (len(flips), len(shared), esc(", ".join(flips))))
+    else:
+        doc.note(r"""
+\textbf{No knob changed its answer between the two budgets.} That is a stronger
+statement than any single-budget sweep can make, and it is what licenses reading
+the rest of this report as advice rather than as a description of one operating
+point.
+""")
 
 
 # ------------------------------------------------------ the winning config
@@ -2318,7 +2751,8 @@ def verify(runs, ks, results_dir, doc, binary, do_run=True):
     tmpl = one(runs, "tuned", "n100_default")
     if tmpl is None:
         return
-    m, seed, steps = tmpl.opts["m"], tmpl.opts["seed"], tmpl.opts["sa-steps"]
+    m, steps = tmpl.opts["m"], tmpl.opts["sa-steps"]
+    seeds = list(tmpl.seeds)
 
     doc.sec("The configuration to use", "sec:best")
     if not kept:
@@ -2357,19 +2791,32 @@ whose interval straddles zero has not earned a change.
     if all((r8, rr8, nall, dflt)):
         s_pair = paired(dflt, rr8)
         s_solo = paired(dflt, nall)
+        # Whether racing was dropped is a result, not a constant: it depends on
+        # whether --restarts cleared its own bar at this budget, which is
+        # exactly what differs between the two tiers.
+        race_dropped = any(l == "racing" for l, _, _, _ in dropped)
+        race_pct = next((s["pct"] for l, _, s, _ in dropped if l == "racing"),
+                        next((s["pct"] for l, _, s, _ in kept if l == "racing"),
+                             float("nan")))
+        rest_kept = any(l.startswith("restarts") for l, _, _, _ in kept)
+        lead = (r"""Racing was worth $%+.3f\,\%%$ on its own and is still dropped,
+because it does nothing without more than one start and \texttt{-{}-restarts}
+did not clear the bar on its own knob at this budget."""
+                % race_pct if race_dropped else
+                r"""Racing was worth $%+.3f\,\%%$ on its own and is kept%s."""
+                % (race_pct,
+                   " --- and so is \\texttt{-{}-restarts}, which is what makes "
+                   "it useful: the two only pay together" if rest_kept else
+                   ", though \\texttt{-{}-restarts} did not clear its own bar, "
+                   "so it has little to redistribute"))
         doc.p(r"""
-\textbf{One caveat the table above cannot express.} Racing was worth
-%s on its own --- the second largest effect in this document --- and it is still
-dropped, because it does nothing without more than one start, and
-\texttt{-{}-restarts} did not clear the bar on its own knob. The two only pay
-together: at $n=100$ and equal total budget, the recommended options with a
+\textbf{One caveat the table above cannot express.} %s At $n=100$ and equal
+total budget, the recommended options with a
 single start reach %.5f (%s vs the default), and the same options with 8 starts
 and racing reach %.5f (%s). If you are going to spend the budget on restarts at
 all, turn racing on; the sweep's one-knob-at-a-time frame simply has no way to
 say so.
-""" % (("%+.3f\\,\\%%" % next(s["pct"] for l, b, s, _ in dropped
-                              if l == "racing")) if any(
-            l == "racing" for l, _, _, _ in dropped) else "its measured amount",
+""" % (lead,
        nall.mean, "%+.3f\\,\\%%" % s_solo["pct"] if s_solo else "--",
        rr8.mean, "%+.3f\\,\\%%" % s_pair["pct"] if s_pair else "--"))
 
@@ -2427,36 +2874,46 @@ substantially --- and the savings parameters were fitted to one geometry.
     if not do_run:
         return
 
-    # Confirmation. Two seeds on purpose: the sweep seed is in-sample and
-    # carries the selection bias, the second one has never been seen.
+    # Confirmation. Two seed *sets* on purpose: the sweep's own seeds are
+    # in-sample and carry the selection bias, the fresh block has never been
+    # seen. Both blocks use as many seeds as the sweep itself, so the two rows
+    # are equally powered and the gap between them is the bias, not noise.
     bdir = os.path.join(results_dir, "best")
     os.makedirs(bdir, exist_ok=True)
-    fresh = 20260801
+    fresh = [20260801 + i for i in range(len(seeds))]
     rows = []
-    print("  verifying the recommended configuration...")
-    for label, sd in (("sweep seed (in-sample)", seed), ("fresh seed", fresh)):
+    print("  verifying the recommended configuration "
+          f"({2 * len(seeds) * 3 * 2} runs)...")
+    for label, sds in (("sweep seeds (in-sample)", seeds), ("fresh seeds", fresh)):
         for n in (50, 100, 200):
-            src = ["--random", "-n", str(n), "-m", str(m), "--seed", str(sd)]
-            # equal TOTAL budget on both sides: the default runs one start of
-            # `steps`, the recommendation runs `nrestarts` starts of
-            # `tuned_steps` each
-            b = run_cw(binary, src + ["--sa-steps", str(steps)],
-                       os.path.join(bdir, f"s{sd}_n{n}_default"))
-            t = run_cw(binary, src + ["--sa-steps", str(tuned_steps)] + flags,
-                       os.path.join(bdir, f"s{sd}_n{n}_tuned"))
-            if not (b.ok and t.ok):
+            got = {"default": [], "tuned": []}
+            for sd in sds:
+                src = ["--random", "-n", str(n), "-m", str(m), "--seed", str(sd)]
+                # equal TOTAL budget on both sides: the default runs one start
+                # of `steps`, the recommendation runs `nrestarts` starts of
+                # `tuned_steps` each
+                b = run_cw(binary, src + ["--sa-steps", str(steps)],
+                           os.path.join(bdir, f"s{sd}_n{n}_default"))
+                t = run_cw(binary, src + ["--sa-steps", str(tuned_steps)] + flags,
+                           os.path.join(bdir, f"s{sd}_n{n}_tuned"))
+                if b.ok and t.ok:
+                    got["default"].append((sd, b))
+                    got["tuned"].append((sd, t))
+            if not got["default"]:
                 continue
+            b = pool("best", f"n{n}_default", got["default"])
+            t = pool("best", f"n{n}_tuned", got["tuned"])
             s = paired(b, t)
             rows.append([esc(label), n, "%.5f" % b.mean, "%.5f" % t.mean,
                          *stat_cells(s)])
     if rows:
         doc.sub("Confirmation")
         doc.p(r"""
-The combination is re-run from scratch, because Section~\ref{sec:tuned} showed that knobs tuned
-separately do not add up. It is checked on the sweep's own instances and on a
-seed the sweep never saw --- the difference between the two is the selection bias
-made visible.
-""")
+The combination is re-run from scratch, because Section~\ref{sec:tuned} showed
+that knobs tuned separately do not add up. It is checked on the sweep's own
+instances and on %d seeds the sweep never saw --- the difference between the two
+blocks is the selection bias made visible.
+""" % len(fresh))
         cap = ("The recommended configuration against the stock defaults, at "
                "equal SA budget. The fresh-seed rows are the honest estimate.")
         if nrestarts > 1:
@@ -2495,10 +2952,11 @@ PREAMBLE = r"""% ---------------------------------------------------------------
 
 \section*{Setup}
 
-@NRUNS@ runs of \texttt{./cw}, @M@ instances each, generated with the
-Kool/NeuOpt law (coordinates $U[0,1]^2$, demands $U\{1,\dots,9\}$, capacity from
-\texttt{default\_capacity}). Unless a study says otherwise, $n=100$ and
-\texttt{-{}-sa-steps}~$=$~@STEPS@.
+@NRUNS@ configurations of \texttt{./cw}, each run at @NSEEDS@ seeds
+(@SEEDS@) of @MPER@ instances, so @M@ instances per configuration. Instances are
+generated with the Kool/NeuOpt law (coordinates $U[0,1]^2$, demands
+$U\{1,\dots,9\}$, capacity from \texttt{default\_capacity}). Unless a study says
+otherwise, $n=100$ and \texttt{-{}-sa-steps}~$=$~@STEPS@.
 
 \textbf{Every comparison is paired.} Instance $k$ is generated from
 \texttt{seed}~$+~k$ (\texttt{cw.c:2574}), so all runs of a study see
@@ -2508,6 +2966,20 @@ the same instance $i$ and report the mean of the @M@ differences with a
 95\,\% confidence interval, plus a distribution-free sign test. This matters: the
 between-instance spread ($\sigma \approx 1.9$ at $n=100$) is more than an order of
 magnitude larger than the effects being measured.
+
+\textbf{Every configuration is replicated on @NSEEDS@ seeds.} \texttt{cw} has a
+single \texttt{-{}-seed}, and it drives both the instance set
+(\texttt{cw.c:2574}) and the annealing RNG (\texttt{cw.c:2679}); there is no way
+to re-randomise the solver while holding the instances fixed. A seed is
+therefore a complete replication --- fresh instances, fresh randomness --- and
+the @NSEEDS@ blocks are concatenated before the paired statistics are taken. No
+conclusion in this report rests on a single instance draw, and each $\Delta$ is
+the mean of @M@ paired differences rather than @MPER@.
+
+\textbf{Everything is measured at two budgets.} Each grid is run at
+$\texttt{-{}-sa-steps} = 10^5$ and again at $10^7$, the budget this solver is
+actually run at. Section~\ref{sec:budget} puts the two side by side; the body of
+the report is the @PRIMARY@ tier.
 
 In every table, $\Delta$ is that paired mean as a percentage of the baseline;
 \textbf{bold} means the CI excludes zero \emph{and} the sign test rejects at
@@ -2526,6 +2998,10 @@ def main():
     ap.add_argument("--results", default=os.path.join(here, "results"))
     ap.add_argument("--out", default=here)
     ap.add_argument("--bin", default=os.path.join(root, "cw"))
+    ap.add_argument("--tier", default="hi", choices=("lo", "hi"),
+                    help="which budget tier carries the report (default: hi, "
+                         "the operating point); the other one is still read, "
+                         "for the budget-dependence section")
     ap.add_argument("--no-verify", action="store_true",
                     help="do not re-run the recommended configuration")
     ap.add_argument("--no-pdf", action="store_true", help="emit the .tex only")
@@ -2533,13 +3009,31 @@ def main():
 
     if not os.path.isdir(a.results):
         sys.exit(f"{a.results} not found — run sweep/run_sweep.sh first")
-    runs = [r for r in load(a.results) if r.study != "best"]
-    if not runs:
-        sys.exit("no successful run found")
-    per = defaultdict(int)
-    for r in runs:
-        per[r.study] += 1
-    print(f"loaded {len(runs)} runs: " + ", ".join(f"{k}={v}" for k, v in sorted(per.items())))
+
+    # Two budget tiers, each a directory of per-seed subdirectories. The
+    # primary tier carries the whole report; the other one exists so that
+    # budget_shift() can say whether the answers transfer.
+    tiers = {}
+    for t in ("lo", "hi"):
+        d = os.path.join(a.results, t)
+        if os.path.isdir(d):
+            got = [r for r in load(d) if r.study != "best"]
+            if got:
+                tiers[t] = got
+    if not tiers:
+        sys.exit(f"no successful run under {a.results}/(lo|hi) — "
+                 "run sweep/run_sweep.sh first")
+    primary = a.tier if a.tier in tiers else ("hi" if "hi" in tiers else "lo")
+    runs = tiers[primary]
+    for t, rs in tiers.items():
+        per = defaultdict(int)
+        for r in rs:
+            per[r.study] += 1
+        nseed = max((r.n_seeds for r in rs), default=0)
+        mark = " (primary)" if t == primary else ""
+        print(f"tier {t}{mark}: {len(rs)} configurations x {nseed} seeds, "
+              f"{tier_steps(rs):,} steps — "
+              + ", ".join(f"{k}={v}" for k, v in sorted(per.items())))
 
     figdir = os.path.join(a.out, "figures")
     os.makedirs(figdir, exist_ok=True)
@@ -2550,6 +3044,11 @@ def main():
         overview(runs, figdir, doc, ks)
     except Exception as e:
         print(f"  !! overview: {e}", file=sys.stderr)
+    if len(tiers) > 1:
+        try:
+            budget_shift(tiers["lo"], tiers["hi"], figdir, doc)
+        except Exception as e:
+            print(f"  !! budget_shift: {e}", file=sys.stderr)
     for fn in (study_init, study_ops, study_newops, study_knn, study_timing,
                study_restarts, study_split, study_pick, study_select,
                study_race, study_temp, study_construct, study_tuned):
@@ -2569,8 +3068,17 @@ def main():
         Nothing here is evidence about clustered or real-world instances; run
         \texttt{tools/fetch\_neuopt.py} and point the sweep at
         \texttt{-{}-bundle} for that.
-  \item \textbf{One budget.} Most grids are at $10^5$ annealing steps. The
-        schedule result in particular is budget-dependent by construction.
+  \item \textbf{Two budgets, not a curve.} Every grid is run at $10^5$ and at
+        $10^7$ annealing steps (Section~\ref{sec:budget}), which is enough to
+        say whether a recommendation transfers but not to fit how it varies.
+        The schedule knob in particular is budget-dependent by construction ---
+        the geometric ratio is $(T_\mathrm{end}/T_0)^{1/(S-1)}$ --- so at a
+        third budget it would have to be re-measured again.
+  \item \textbf{The two tiers use different instance counts.} $m=1000$ per seed
+        at $10^5$ steps and $m=200$ at $10^7$, to keep the total compute
+        bounded. Pooled over the seeds both tiers carry $\ge 1000$ paired
+        instances, so their CIs are comparable, but the $10^7$ tier is the
+        looser of the two.
   \item \textbf{Selection bias.} The overview picks each knob's best setting
         \emph{because} it scored lowest. The fresh-seed rows in
         Section~\ref{sec:best} are the only bias-free numbers in this document.
@@ -2609,7 +3117,12 @@ def main():
     for tok, val in (                  # the preamble is full of literal LaTeX %
             ("@DATE@", datetime.date.today().isoformat()),
             ("@NRUNS@", str(len(runs))),
-            ("@M@", f"{tmpl.opts['m']:,}"),
+            ("@NSEEDS@", str(tmpl.n_seeds)),
+            ("@SEEDS@", ", ".join(str(s) for s in tmpl.seeds)),
+            ("@MPER@", f"{tmpl.opts['m']:,}"),
+            ("@M@", f"{tmpl.opts['m'] * tmpl.n_seeds:,}"),
+            ("@PRIMARY@", r"$10^{%d}$-step"
+                          % round(math.log10(max(1, tmpl.opts["sa-steps"])))),
             ("@STEPS@", f"{tmpl.opts['sa-steps']:,}")):
         head = head.replace(tok, val)
     tex = head + "\n".join(doc.body) + "\n\n\\end{document}\n"

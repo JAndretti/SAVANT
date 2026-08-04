@@ -34,13 +34,15 @@ so index k means the same instance everywhere. The CSV is the reference these
 sets are actually worth measuring against — an optimum or a BKS is a far better
 yardstick than another heuristic.
 
-Extraction uses bsdtar, which reads .7z natively and ships with macOS and most
-Linux distributions; no 7-Zip install and no extra Python dependency.
+The archives are .7z. Extraction uses whichever reader the machine has —
+bsdtar (macOS, Debian libarchive-tools), the 7-Zip CLI, or the pure-Python
+py7zr — so no particular one is required; see extract().
 
 Usage:
     python3 tools/fetch_cvrplib.py                    # all three sets
     python3 tools/fetch_cvrplib.py --sets X XL
     python3 tools/fetch_cvrplib.py --sets X --verify  # check the convention
+    uv run --with py7zr tools/fetch_cvrplib.py        # no system extractor
 """
 
 import argparse
@@ -93,10 +95,33 @@ def download(url, dest):
 
 
 def extract(archive, into):
-    if not shutil.which("bsdtar"):
-        raise SystemExit("bsdtar not found — it reads .7z and ships with macOS "
-                         "and most Linux distributions (Debian: libarchive-tools)")
-    subprocess.run(["bsdtar", "-xf", archive, "-C", into], check=True)
+    """Unpack a .7z, using whatever this machine happens to have.
+
+    Tried in order, so that a plain `python3 tools/fetch_cvrplib.py` works on a
+    machine with no 7-Zip and no root: bsdtar (macOS, Debian libarchive-tools),
+    the 7-Zip CLI under any of its four names, then the pure-Python py7zr.
+    """
+    for exe, args in (("bsdtar", ["-xf", archive, "-C", into]),
+                      ("7zz", ["x", "-y", f"-o{into}", archive]),
+                      ("7z", ["x", "-y", f"-o{into}", archive]),
+                      ("7za", ["x", "-y", f"-o{into}", archive]),
+                      ("7zr", ["x", "-y", f"-o{into}", archive])):
+        if shutil.which(exe):
+            subprocess.run([exe] + args, check=True,
+                           stdout=subprocess.DEVNULL)
+            return
+    try:
+        import py7zr
+    except ImportError:
+        raise SystemExit(
+            "no .7z extractor found. Any one of these is enough:\n"
+            "  Debian/Ubuntu : apt install libarchive-tools   (bsdtar)\n"
+            "  Fedora/RHEL   : dnf install bsdtar\n"
+            "  Arch          : pacman -S libarchive\n"
+            "  macOS         : bsdtar is already there\n"
+            "  no root       : uv run --with py7zr tools/fetch_cvrplib.py ...")
+    with py7zr.SevenZipFile(archive, "r") as z:
+        z.extractall(path=into)
 
 
 def read_vrp(path):
