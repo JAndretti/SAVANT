@@ -15,10 +15,17 @@ cmd.txt
 # reference implementation received by mail, kept locally only
 code yann /
 paper/
+report/
 
 # Run outputs (run.py writes one directory per run)
 res/
 results/
+
+# Scratch space (reviews, ad-hoc measurements)
+tmp/
+sweep/
+tests/
+timing/
 
 # Compiled solver (regenerate with make / make debug / make trace)
 cw

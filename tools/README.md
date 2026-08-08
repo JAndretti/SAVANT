@@ -12,6 +12,12 @@ so they behave identically from any working directory.
 | `validate.py` | independent solution checker, plus gaps to HGS / LKH-3 |
 | `fetch_neuopt.py` | downloads and converts the NeuOpt CVRP test sets |
 | `analyze.py` | statistics and plots for one run, or a comparison across runs |
+| `_common.py` | not a tool: the cost recomputation and binary fingerprint shared by `run_hgs.py`, `run_lkh.py` and `run_ails.py` |
+
+`_common.py` holds only what those three runners had verbatim in common. It does
+not touch the redundancy that carries the verification argument: its `recompute`
+is still Python written against the C solver, and `validate.py` redoes the same
+work a third time from the files on disk, sharing nothing with either.
 
 `analyze.py` needs `matplotlib` and `numpy` (`uv sync`); the other three are pure
 standard library.

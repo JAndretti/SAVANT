@@ -36,6 +36,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 
 HERE = os.path.dirname(os.path.abspath(__file__))       # tools/
 ROOT = os.path.dirname(HERE)                            # repository root
@@ -55,6 +56,12 @@ SUMMARY_PATTERNS = (
     ("sa_accept_pct", r"annealing acceptance rate\s*:\s*([\d.]+) %"),
     ("t0_mean", r"mean calibrated T0\s*:\s*([\d.eE+-]+)\)"),
     ("drift_max", r"max incremental-cost drift\s*:\s*([\d.eE+-]+)"),
+    # --sa-time: the step count it bought is the only thing that makes such a
+    # run replayable, so it belongs in config.json rather than only in the log
+    ("sa_time_s", r"steps bought by --sa-time ([\d.eE+-]+) s"),
+    ("steps_mean", r"steps bought by --sa-time [\d.eE+-]+ s\s*:\s*(\d+) mean"),
+    ("steps_min", r"steps bought by --sa-time .*?\(min (\d+),"),
+    ("steps_max", r"steps bought by --sa-time .*?\(min \d+, max (\d+)"),
     ("cost_median", r"median / min / max\s*:\s*([\d.]+)"),
     ("cost_min", r"median / min / max\s*:\s*[\d.]+ / ([\d.]+)"),
     ("cost_max", r"median / min / max\s*:\s*[\d.]+ / [\d.]+ / ([\d.]+)"),
@@ -104,6 +111,36 @@ def _has_openmp(path):
     return None
 
 
+def tee(cmd):
+    """Run cmd, echoing its output as it comes, and return (rc, out, err).
+
+    subprocess.run(capture_output=True) would hold the whole child output in
+    memory and show nothing until it exits -- minutes of silence on a long
+    --per-instance run over 10 000 instances. The two pipes are drained by
+    threads, which is what keeps a child writing a lot on stderr from
+    deadlocking on a full pipe buffer.
+    """
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True, bufsize=1)
+    chunks = {"out": [], "err": []}
+
+    def pump(src, key, dst):
+        for line in src:
+            chunks[key].append(line)
+            dst.write(line)
+            dst.flush()
+        src.close()
+
+    threads = [threading.Thread(target=pump, args=(p.stdout, "out", sys.stdout)),
+               threading.Thread(target=pump, args=(p.stderr, "err", sys.stderr))]
+    for t in threads:
+        t.start()
+    rc = p.wait()
+    for t in threads:
+        t.join()
+    return rc, "".join(chunks["out"]), "".join(chunks["err"])
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Run ./cw inside a dedicated run directory",
@@ -147,13 +184,13 @@ def main():
     os.makedirs(run_dir, exist_ok=True)
     started = _dt.datetime.now()
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True)
+        rc, out, err = tee(cmd)
     except OSError as e:
         shutil.rmtree(run_dir, ignore_errors=True)
         raise SystemExit(f"failed to launch: {e}")
     ended = _dt.datetime.now()
 
-    log = p.stdout + (("\n--- stderr ---\n" + p.stderr) if p.stderr else "")
+    log = out + (("\n--- stderr ---\n" + err) if err else "")
     with open(os.path.join(run_dir, "run.log"), "w", encoding="utf-8") as f:
         f.write(log)
 
@@ -164,11 +201,11 @@ def main():
             "started": started.isoformat(timespec="seconds"),
             "ended": ended.isoformat(timespec="seconds"),
             "elapsed_s": round((ended - started).total_seconds(), 3),
-            "exit_code": p.returncode,
+            "exit_code": rc,
         },
         "command": " ".join(cmd),
         "cw_args": passthrough,
-        "resolved": [l[1:].strip() for l in p.stdout.splitlines() if l.startswith("#")],
+        "resolved": [l[1:].strip() for l in out.splitlines() if l.startswith("#")],
         "binary": binary_fingerprint(args.bin),
         "environment": {
             "host": platform.node(),
@@ -177,20 +214,17 @@ def main():
             "cpu_count": os.cpu_count(),
             "python": platform.python_version(),
         },
-        "result": parse_summary(p.stdout),
+        "result": parse_summary(out),
     }
     with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
         f.write("\n")
 
-    print(p.stdout, end="")
-    if p.stderr:
-        print(p.stderr, end="", file=sys.stderr)
     print(f"\n-> {run_dir}")
     for name in sorted(os.listdir(run_dir)):
         size = os.path.getsize(os.path.join(run_dir, name))
         print(f"   {name:16} {size:>12,} B")
-    return p.returncode
+    return rc
 
 
 if __name__ == "__main__":

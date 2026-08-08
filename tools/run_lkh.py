@@ -46,7 +46,6 @@ import argparse
 import concurrent.futures as cf
 import csv
 import datetime as _dt
-import hashlib
 import json
 import math
 import os
@@ -63,6 +62,7 @@ ROOT = os.path.dirname(HERE)
 RESULTS = os.path.join(ROOT, "results")
 
 sys.path.insert(0, HERE)
+from _common import binary_fingerprint, recompute  # noqa: E402
 from fetch_cvrplib import read_vrp  # noqa: E402
 from bundle_to_vrp import read_bundle, write_vrp, instance_name  # noqa: E402
 
@@ -115,40 +115,6 @@ def parse_mtsp(path):
     return routes, penalty, cost
 
 
-def recompute(routes, xs, ys, ds, cap, n):
-    """Cost recomputed from the coordinates, integer EUC_2D, plus faults."""
-    def d(a, b):
-        return math.floor(math.hypot(xs[a] - xs[b], ys[a] - ys[b]) + 0.5)
-
-    seen = [0] * (n + 1)
-    total = 0.0
-    problems = []
-    nroutes = 0
-    for r, route in enumerate(routes):
-        if not route:
-            continue
-        nroutes += 1
-        load = 0.0
-        prev = 0
-        for c in route:
-            if not 1 <= c <= n:
-                problems.append(f"customer {c} out of range")
-                continue
-            if seen[c]:
-                problems.append(f"customer {c} served twice")
-            seen[c] = 1
-            total += d(prev, c)
-            load += ds[c]
-            prev = c
-        total += d(prev, 0)
-        if load > cap + 1e-9:
-            problems.append(f"route {r} overloaded ({load:g} > {cap:g})")
-    missing = [c for c in range(1, n + 1) if not seen[c]]
-    if missing:
-        problems.append(f"{len(missing)} customer(s) unserved, e.g. {missing[:5]}")
-    return total, nroutes, problems
-
-
 def solve_one(job):
     """One LKH-3 run. Never raises."""
     idx, name, vrp, veh, workdir, lkh, opts = job
@@ -190,16 +156,6 @@ def solve_one(job):
     return {"idx": idx, "name": name, "veh": veh, "wall": wall,
             "routes": routes, "announced": cost, "penalty": 0,
             "stderr": p.stderr.strip()}
-
-
-def binary_fingerprint(path):
-    try:
-        with open(path, "rb") as f:
-            digest = hashlib.sha256(f.read()).hexdigest()[:16]
-        return {"path": os.path.relpath(path, ROOT), "sha256_16": digest,
-                "size": os.path.getsize(path)}
-    except OSError:
-        return {"path": path}
 
 
 def main():
@@ -356,7 +312,8 @@ def main():
                          "routes": "", "vehicles": fleets[k][0], "wall_s": "",
                          "lkh_cost": "", "status": "FAILED"})
             continue
-        cost, nroutes, problems = recompute(r["routes"], xs, ys, ds, cap, n)
+        cost, nroutes, problems = recompute(r["routes"], xs, ys, ds, cap, n,
+                                            rounded=True)
         rel = abs(cost - r["announced"]) / (cost if cost > 0 else 1.0)
         worst_rel = max(worst_rel, rel)
         if rel > 1e-9:
@@ -417,7 +374,7 @@ def main():
         "lkh_par": {"SPECIAL": True, **{k: v for k, v in opts}},
         "vehicles_source": ("instance name where present, else the "
                             "bin-packing lower bound"),
-        "binary": binary_fingerprint(args.lkh),
+        "binary": binary_fingerprint(args.lkh, root=ROOT),
         "environment": {"host": platform.node(), "platform": platform.platform(),
                         "machine": platform.machine(),
                         "cpu_count": os.cpu_count()},

@@ -47,9 +47,7 @@ import argparse
 import concurrent.futures as cf
 import csv
 import datetime as _dt
-import hashlib
 import json
-import math
 import os
 import platform
 import re
@@ -66,6 +64,7 @@ DEFAULT_HGS = os.path.join(ROOT, "external", "HGS-CVRP", "build", "hgs")
 RESULTS = os.path.join(ROOT, "results")
 
 sys.path.insert(0, HERE)
+from _common import binary_fingerprint, recompute  # noqa: E402
 from bundle_to_vrp import read_bundle, write_vrp, instance_name  # noqa: E402
 from fetch_cvrplib import read_vrp as read_cvrplib_vrp  # noqa: E402
 
@@ -94,48 +93,6 @@ def parse_sol(path):
     if cost is None:
         raise ValueError(f"{path}: no Cost line")
     return routes, cost
-
-
-def recompute(routes, xs, ys, ds, cap, n, rounded):
-    """Cost recomputed from the coordinates, plus a feasibility verdict.
-
-    Deliberately independent of HGS's own arithmetic: this is what lands in
-    solutions.txt, and validate.py will redo it a third time.
-    """
-    if rounded:
-        def d(a, b):
-            return math.floor(math.hypot(xs[a] - xs[b], ys[a] - ys[b]) + 0.5)
-    else:
-        def d(a, b):
-            return math.hypot(xs[a] - xs[b], ys[a] - ys[b])
-
-    seen = [0] * (n + 1)
-    total = 0.0
-    problems = []
-    nroutes = 0
-    for r, route in enumerate(routes):
-        if not route:
-            continue
-        nroutes += 1
-        load = prev = 0
-        prev = 0
-        for c in route:
-            if not 1 <= c <= n:
-                problems.append(f"customer {c} out of range")
-                continue
-            if seen[c]:
-                problems.append(f"customer {c} served twice")
-            seen[c] = 1
-            total += d(prev, c)
-            load += ds[c]
-            prev = c
-        total += d(prev, 0)
-        if load > cap + 1e-9:
-            problems.append(f"route {r} overloaded ({load} > {cap})")
-    missing = [c for c in range(1, n + 1) if not seen[c]]
-    if missing:
-        problems.append(f"{len(missing)} customer(s) unserved, e.g. {missing[:5]}")
-    return total, nroutes, problems
 
 
 def solve_one(job):
@@ -168,18 +125,6 @@ def solve_one(job):
         return {"idx": idx, "name": name, "wall": wall, "error": str(e)}
     return {"idx": idx, "name": name, "wall": wall, "routes": routes,
             "announced": announced, "stderr": p.stderr.strip()}
-
-
-def binary_fingerprint(path):
-    try:
-        with open(path, "rb") as f:
-            digest = hashlib.sha256(f.read()).hexdigest()[:16]
-        return {"path": path, "sha256_16": digest,
-                "mtime": _dt.datetime.fromtimestamp(
-                    os.path.getmtime(path)).isoformat(timespec="seconds"),
-                "size": os.path.getsize(path)}
-    except OSError:
-        return {"path": path}
 
 
 def hgs_version(repo):
@@ -462,7 +407,7 @@ def main():
         "instance_names": names if args.indir else None,
         "hgs_args": argv,
         "hgs_commit": hgs_version(os.path.join(ROOT, "external", "HGS-CVRP")),
-        "binary": binary_fingerprint(args.hgs),
+        "binary": binary_fingerprint(args.hgs, mtime=True),
         "environment": {
             "host": platform.node(),
             "platform": platform.platform(),

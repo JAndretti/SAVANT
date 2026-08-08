@@ -50,9 +50,7 @@ import concurrent.futures as cf
 import csv
 import datetime as _dt
 import glob
-import hashlib
 import json
-import math
 import os
 import platform
 import re
@@ -68,6 +66,7 @@ RESULTS = os.path.join(ROOT, "results")
 DEFAULT_JAR = os.path.join(ROOT, "external", "AILS-II", "AILSII.jar")
 
 sys.path.insert(0, HERE)
+from _common import binary_fingerprint, recompute  # noqa: E402
 from fetch_cvrplib import read_vrp, read_sol  # noqa: E402
 from bundle_to_vrp import read_bundle, write_vrp, instance_name  # noqa: E402
 
@@ -101,43 +100,6 @@ def find_java(explicit):
     return "java"
 
 
-def recompute(routes, xs, ys, ds, cap, n, rounded):
-    if rounded:
-        def d(a, b):
-            return math.floor(math.hypot(xs[a] - xs[b], ys[a] - ys[b]) + 0.5)
-    else:
-        def d(a, b):
-            return math.hypot(xs[a] - xs[b], ys[a] - ys[b])
-
-    seen = [0] * (n + 1)
-    total = 0.0
-    problems = []
-    nroutes = 0
-    for r, route in enumerate(routes):
-        if not route:
-            continue
-        nroutes += 1
-        load = 0.0
-        prev = 0
-        for c in route:
-            if not 1 <= c <= n:
-                problems.append(f"customer {c} out of range")
-                continue
-            if seen[c]:
-                problems.append(f"customer {c} served twice")
-            seen[c] = 1
-            total += d(prev, c)
-            load += ds[c]
-            prev = c
-        total += d(prev, 0)
-        if load > cap + 1e-9:
-            problems.append(f"route {r} overloaded ({load:g} > {cap:g})")
-    missing = [c for c in range(1, n + 1) if not seen[c]]
-    if missing:
-        problems.append(f"{len(missing)} customer(s) unserved, e.g. {missing[:5]}")
-    return total, nroutes, problems
-
-
 def solve_one(job):
     idx, name, vrp, soldir, java, jar, heap, rounded, limit = job
     out = os.path.join(soldir, name + ".sol")
@@ -167,16 +129,6 @@ def solve_one(job):
                 "error": "solution file has no Cost line"}
     return {"idx": idx, "name": name, "wall": wall, "routes": routes,
             "announced": cost, "stderr": p.stderr.strip()}
-
-
-def binary_fingerprint(path):
-    try:
-        with open(path, "rb") as f:
-            digest = hashlib.sha256(f.read()).hexdigest()[:16]
-        return {"path": os.path.relpath(path, ROOT), "sha256_16": digest,
-                "size": os.path.getsize(path)}
-    except OSError:
-        return {"path": path}
 
 
 def main():
@@ -377,7 +329,7 @@ def main():
         "budget_is": "wall clock, not CPU",
         "patched": "tools/ails_solution_output.patch (adds -solution; "
                    "no algorithmic change)",
-        "binary": binary_fingerprint(args.jar),
+        "binary": binary_fingerprint(args.jar, root=ROOT),
         "environment": {"host": platform.node(), "platform": platform.platform(),
                         "machine": platform.machine(),
                         "cpu_count": os.cpu_count()},

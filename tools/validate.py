@@ -323,7 +323,7 @@ def main():
         mean = total_recomputed / len(sols)
         print(f"  mean cost : {mean:.6f}")
         errors += check_against_config(mean, cfg)
-        report_gaps(mean, sizes, args.baseline)
+        report_gaps(mean, sizes, args.baseline, rounded)
         report_timing(cfg, len(sols))
     return 1 if errors else 0
 
@@ -405,12 +405,20 @@ def check_against_config(mean, cfg):
     return 0
 
 
-def report_gaps(mean, sizes, baseline_path):
+def report_gaps(mean, sizes, baseline_path, rounded=False):
     """Compare the recomputed mean cost with the published references.
 
     The comparison only makes sense when every validated instance has the same
-    size: the published objectives are per value of n.
+    size (the published objectives are per value of n) AND under the same
+    distance convention. baseline.csv holds objectives for the generated float
+    sets, so quoting them against a --round run of XML100 -- which also has
+    n = 100 -- produced a "+110110 %" gap against a number from a different
+    problem entirely.
     """
+    if rounded:
+        print("  (integer distances: baseline.csv is for the float sets, "
+              "no comparison)")
+        return
     if len(sizes) > 1:
         print(f"  (mixed sizes {sorted(sizes)}: no comparison)")
         return
