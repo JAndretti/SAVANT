@@ -1,0 +1,50 @@
+--- a/LKH-3.0.14/SRC/LKH.c
++++ b/LKH-3.0.14/SRC/LKH.c
+@@ -16,6 +16,7 @@
+ int Backtracking;       /* Specifies whether backtracking is used for 
+                            the first move in a sequence of moves */
+ GainType BestCost;      /* Cost of the tour in BestTour */
++GainType TraceBest = PLUS_INFINITY; /* SAVANT benchmark patch */
+ GainType BestPenalty;   /* Penalty of the tour in BestTour */
+ int *BestTour;          /* Table containing best tour found */
+ GainType BetterCost;    /* Cost of the tour stored in BetterTour */
+--- a/LKH-3.0.14/SRC/LKHmain.c
++++ b/LKH-3.0.14/SRC/LKHmain.c
+@@ -132,6 +132,7 @@
+             (CurrentPenalty == BestPenalty && Cost < BestCost)) {
+             BestPenalty = CurrentPenalty;
+             BestCost = Cost;
++            TRACE_BEST(CurrentPenalty, Cost);
+             RecordBetterTour();
+             RecordBestTour();
+             BestRouteNodes = RouteNodes;
+--- a/LKH-3.0.14/SRC/FindTour.c
++++ b/LKH-3.0.14/SRC/FindTour.c
+@@ -98,6 +98,7 @@
+                 printff("* %d: ", Trial);
+                 StatusReport(Cost, EntryTime, "");
+             }
++            TRACE_BEST(CurrentPenalty, Cost);
+             BetterCost = Cost;
+             BetterPenalty = CurrentPenalty;
+             BetterRouteNodes = RouteNodes;
+--- a/LKH-3.0.14/SRC/INCLUDE/LKH.h
++++ b/LKH-3.0.14/SRC/INCLUDE/LKH.h
+@@ -651,5 +651,17 @@
+ void WritePenalties(void);
+ void WriteTour(char * FileName, int * Tour, GainType Cost);
+ 
++/* SAVANT benchmark patch: print each new best feasible cost with the time
++   since start (same clock as TOTAL_TIME_LIMIT). Output only. */
++extern GainType TraceBest;
++#define TRACE_BEST(Pen, C) \
++    do { \
++        if ((Pen) == 0 && (C) < TraceBest) { \
++            TraceBest = (C); \
++            printff("TRACE %.3f " GainFormat "\n", GetTime() - StartTime, \
++                    TraceBest); \
++        } \
++    } while (0)
++
+ #endif
+ 

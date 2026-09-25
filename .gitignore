@@ -1,0 +1,54 @@
+# Allow-list: everything is ignored unless listed below, so that `git add .` can
+# never publish third-party solvers (LKH-3's licence forbids redistribution), the
+# CVRPLIB/NDS instance collections, publishers' PDFs or 10 GB of build trees.
+# To publish something new, add a `!` line here on purpose.
+/*
+
+# --- our code ------------------------------------------------------------
+!/.gitignore
+!/README.md
+!/LICENSE
+!/Makefile
+!/pyproject.toml
+!/uv.lock
+!/.python-version
+!/SAVANT/
+!/bench/
+!/scripts/
+
+# --- cluster jobs (Jean Zay), without logs or the files of the dropped plan ---
+!/slurm/
+/slurm/logs/
+# our Jean Zay project, login and paths (the published files are anonymised)
+/slurm/LOCAL.md
+/slurm/tmax_ails_n*.sbatch
+/slurm/tmax_ortools_n*.sbatch
+/slurm/tmax_*_vrp_100.sbatch
+
+# --- baselines: our patches and the NDS environment only ------------------
+!/external_code/
+/external_code/*
+!/external_code/patches/
+!/external_code/nds_env/
+/external_code/nds_env/*
+!/external_code/nds_env/pyproject.toml
+!/external_code/nds_env/uv.lock
+
+# --- data: only what we generated or decided ------------------------------
+!/data/
+/data/*
+!/data/tuning/
+# CVRPLIB instances, named in data/tuning/xml100.txt
+/data/tuning/xml100/
+!/data/cvrplib/
+/data/cvrplib/*
+# BKS snapshot of 2026-09-15, the reference of the paper
+!/data/cvrplib/*_bks.csv
+!/data/cvrplib/*_invalid_ref.txt
+!/data/cvrplib/XML100_test.txt
+
+# --- everywhere ------------------------------------------------------------
+__pycache__/
+*.py[oc]
+*.so
+.venv/

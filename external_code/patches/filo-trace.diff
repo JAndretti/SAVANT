@@ -1,0 +1,23 @@
+--- a/filo-master/main.cpp
++++ b/filo-master/main.cpp
+@@ -194,6 +194,12 @@
+     const auto coreopt_iterations = arg_parser.get_coreopt_iterations();
+ 
+     auto best_solution = solution;
++    // SAVANT benchmark patch: new best costs with the time since start. Output only.
++    const auto trace_best = [&global_time_begin](double cost) {
++        const auto s = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - global_time_begin).count();
++        std::cout << "TRACE " << std::fixed << std::setprecision(6) << s << " " << std::setprecision(10) << std::defaultfloat << cost << "\n";
++    };
++    trace_best(best_solution.get_cost());
+     #ifdef VERBOSE
+     auto best_solution_time = std::chrono::high_resolution_clock::now();
+     #endif
+@@ -348,6 +354,7 @@
+         if (neighbor.get_cost() < best_solution.get_cost()) {
+ 
+             best_solution = neighbor;
++            trace_best(best_solution.get_cost());
+             #ifdef VERBOSE
+             best_solution_time = std::chrono::high_resolution_clock::now();
+             #endif

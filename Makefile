@@ -1,0 +1,54 @@
+CC      ?= gcc
+CFLAGS  ?= -O3 -march=native -funroll-loops -fno-math-errno -std=gnu11 -Wall -Wextra
+LDFLAGS ?= -lm
+OMP     ?= -fopenmp
+SRC     := SAVANT/cw.c
+
+all: cw
+
+cw: $(SRC)
+	$(CC) $(CFLAGS) $(OMP) -o $@ $< $(LDFLAGS)
+
+# Portable entry point: pick whichever of the three below this machine can
+# actually do, by trying to compile rather than by guessing from `uname`.
+# GCC and LLVM clang take a bare -fopenmp; Apple clang does not and needs
+# Homebrew's libomp (the macos target); failing both, build single-threaded.
+auto:
+	@if $(CC) $(CFLAGS) $(OMP) -o cw $(SRC) $(LDFLAGS) 2>/dev/null; then \
+	     echo "  OpenMP: $(CC) $(OMP)  -> parallel"; \
+	 elif $(MAKE) --no-print-directory macos >/dev/null 2>&1; then \
+	     echo "  OpenMP: Apple clang + libomp  -> parallel"; \
+	 else \
+	     $(MAKE) --no-print-directory serial; \
+	     echo "  OpenMP: unavailable  -> single-threaded (--threads is a no-op)"; \
+	 fi
+
+# bit-reproducible build: disables FMA contraction, whose application depends
+# on the compiler and on the shape of the code. Costs ~20 % at small n.
+repro: $(SRC)
+	$(CC) $(CFLAGS) -ffp-contract=off $(OMP) -o cw_repro $< $(LDFLAGS)
+
+# macOS + Apple clang: OpenMP via Homebrew's libomp (brew install libomp).
+# Apple clang rejects a bare -fopenmp, and libomp is keg-only: hence
+# -Xpreprocessor and the explicit paths. The prefix can be forced by hand:
+# make macos OMPROOT=/opt/homebrew/opt/libomp
+macos: CC := clang
+macos: $(SRC)
+	@P="$(OMPROOT)"; test -n "$$P" || P=$$(brew --prefix libomp 2>/dev/null); \
+	 test -n "$$P" && test -f "$$P/include/omp.h" || { \
+	     echo "libomp not found: brew install libomp" >&2; exit 1; }; \
+	 set -x; \
+	 $(CC) $(CFLAGS) -Xpreprocessor -fopenmp -I"$$P/include" \
+	       -o cw $< $(LDFLAGS) -L"$$P/lib" -lomp
+
+# build without OpenMP (macOS/clang lacking libomp: see the macos target)
+serial: $(SRC)
+	$(CC) $(CFLAGS) -o cw $< $(LDFLAGS)
+
+debug: $(SRC)
+	$(CC) -O0 -g -fsanitize=address,undefined -std=gnu11 -Wall -Wextra -o cw_dbg $< $(LDFLAGS)
+
+clean:
+	rm -f cw cw_repro cw_dbg
+
+.PHONY: all auto repro macos serial debug clean

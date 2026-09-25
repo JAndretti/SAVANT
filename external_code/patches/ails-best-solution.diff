@@ -1,0 +1,13 @@
+--- a/AILS-CVRP-main/src/SearchMethod/AILSII.java
++++ b/AILS-CVRP-main/src/SearchMethod/AILSII.java
+@@ -202,6 +202,10 @@
+ 		AILSII ailsII=new AILSII(instance,reader);
+ 		
+ 		ailsII.search();
++		// SAVANT benchmark patch: emit the best solution (CVRPLIB .sol format)
++		// so that it can be checked independently of the solver.
++		System.out.println("=== BEST SOLUTION ===");
++		System.out.print(ailsII.getBestSolution());
+ 	}
+ 	
+ 	public Solution getBestSolution() {

@@ -1,0 +1,26 @@
+# Environment for running NDS (Hottung et al. 2025, external_code/NDS) from bench/nds_cvrp.py.
+# Kept apart from the main project so the validated CPU environment is untouched.
+#   uv sync --project external_code/nds_env
+[project]
+name = "savant-nds-env"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "numpy>=2.0,<2.4",          # 2.4 made int(<1-element array>) an error; NDS relies on it
+    "torch>=2.8",
+    "cppimport>=22.8.2",
+    "pybind11>=2.13,<3",        # 3.x refuses the 1-element capacity arrays NDS passes as int
+    "pyyaml>=6.0",
+    "omegaconf>=2.3",           # the checkpoints pickle their config as omegaconf objects
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true

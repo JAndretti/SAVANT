@@ -1,0 +1,30 @@
+--- a/filo2-main/main.cpp
++++ b/filo2-main/main.cpp
+@@ -62,6 +62,11 @@
+     timer.reset();
+ #endif
+     cobra::clarke_and_wright(instance, best_solution, params.get_cw_lambda(), params.get_cw_neighbors());
++    // SAVANT benchmark patch: new best costs with the time since start. Output only.
++    const auto trace_best = [&global_timer](double cost) {
++        std::printf("TRACE %.6f %.10g\n", global_timer.elapsed_time<std::chrono::microseconds>() / 1e6, cost);
++    };
++    trace_best(best_solution.get_cost());
+ #ifdef VERBOSE
+     std::cout << "Done in " << timer.elapsed_time<std::chrono::seconds>() << " seconds.\n";
+     std::cout << "Initial solution: obj = " << best_solution.get_cost() << ", n. of routes = " << best_solution.get_routes_num() << ".\n\n";
+@@ -116,6 +121,7 @@
+ #endif
+ 
+         best_solution = routemin(instance, best_solution, rand_engine, move_generators, kmin, routemin_iterations, tolerance);
++        trace_best(best_solution.get_cost());
+ 
+ #ifdef VERBOSE
+         std::cout << "Final solution: obj = " << best_solution.get_cost() << ", n. routes = " << best_solution.get_routes_num() << "\n";
+@@ -339,6 +345,7 @@
+             neighbor.clear_do_list2();
+ 
+             assert(best_solution == neighbor);
++            trace_best(best_solution.get_cost());
+ 
+ 
+             gamma_vertices.clear();
