@@ -216,8 +216,26 @@ typedef struct {
     long   sa_steps;        /* 64-bit: 2^31 steps is only ~140 s at 15 M/s */
     int    sa_knn, check, split, split_every, split_tour;
     int    restarts, cw_rand, pick_t, pick_crit;
+    int    op_cycle, kick_early;
+    int    kick_repair, repair_top, repair_k;   /* --kick-repair M, P4 A    */
     int    pick2, vrank, reloc_side, pair;   /* new, all neutral by default */
     double race, race_at;                    /* racing between starts       */
+    double pursue;                           /* --pursue F, 0 = off           */
+    double elim_frac;       /* --elim F        : final phase, share F of the budget */
+    int    elim_mode;       /* --elim-mode M   : 0 re-anneal only, 1, 2, 3 (N&B) */
+    double elim_sigma;      /* --elim-sigma S  : M = 2, weight of p(v) - 1   */
+    double elim_thi;        /* --elim-thi X    : re-anneal from X * Tend ... */
+    double elim_thi2;       /* --elim-thi2 X   : ... or X * Tend after an
+                                                 elimination                 */
+    double elim_iter;       /* --elim-iter I   : at most I * n insertions    */
+    int    elim_kmax;       /* --elim-kmax K   : customers ejected at once   */
+    int    elim_max;        /* --elim-max K    : M = 3, routes removed at most */
+    int    elim_perturb;    /* --elim-perturb I: M = 3, random moves per step  */
+    double elim_tp;         /* --elim-tp X     : M = 3, their temperature,
+                                                 x Tend (<= 0: any feasible)   */
+    int    elim_ej;         /* --elim-ej E     : M = 3, ejection rule 1 or 2   */
+    int    elim_levels;     /* --elim-levels L : M = 3, 0 = anneal the last
+                                                 level only, 1 = every level   */
     double pick_eps;
     double cw_alpha;
     double sa_t0, sa_tend, sa_chi0, sa_decades;
@@ -534,6 +552,7 @@ typedef struct {
     int     xy_ok, lb_k;              /* per-instance caches */
     int     fen_pw, crit, or_max, pick2, vrank, reloc_side, need_bnx;
     uint32_t th1, th2, th3, th4, th5;
+    unsigned char cyc[2048]; int cyc_len, cyc_i;   /* --op-cycle (0 = off) */
     /* --- enhancement state, inert unless the matching option is set --- */
     uint32_t empty_thr;      /* --empty-p as a uint32 threshold, 0 = off     */
     int     *estack, enum_;  /* ids of routes seen empty (a hint, verified)  */
@@ -542,6 +561,8 @@ typedef struct {
     long     step, dlb_win;  /* annealing clock, staleness window in steps   */
     long    *touch;          /* step at which each node last moved           */
     int      kick_max;       /* --kick-max                                   */
+    int      kick_early, kick_repair, repair_top, repair_k;
+    double  *kbuf;           /* --kick-repair: removal deltas of a route     */
     uint32_t *ktag, kick_gen; /* customers currently out, per kick generation */
     int     *pos;            /* position of a customer in the route buffer   */
     /* --trace: (elapsed s, best cost) pairs of the instance being solved */
@@ -607,6 +628,7 @@ static void ws_ensure(WS *w, int n, int K, size_t nsav)
         w->bufB = (int *)xrealloc(w->bufB, (size_t)(c + 2) * sizeof(int));
         w->bufC = (int *)xrealloc(w->bufC, (size_t)(c + 2) * sizeof(int));
         w->bufD = (int *)xrealloc(w->bufD, (size_t)(c + 2) * sizeof(int));
+        w->kbuf = (double *)xrealloc(w->kbuf, (size_t)(c + 2) * sizeof(double));
         w->tour   = (int *)xrealloc(w->tour,   (size_t)(c + 2) * sizeof(int));
         w->spPred = (int *)xrealloc(w->spPred, (size_t)(c + 2) * sizeof(int));
         w->spDq   = (int *)xrealloc(w->spDq,   (size_t)(c + 2) * sizeof(int));
@@ -660,7 +682,7 @@ static void ws_free(WS *w)
     free(w->b2_nxt); free(w->b2_prv); free(w->b2_rid); free(w->b2_load);
     free(w->inc2); free(w->bnx2); free(w->bad2);
     free(w->r_nxt); free(w->r_prv); free(w->r_rid); free(w->r_load); free(w->xy); free(w->lb); free(w->bad_o); free(w->inc_o); free(w->bnx_o); free(w->fen); free(w->fen_wv);
-    free(w->bufA); free(w->bufB); free(w->bufC); free(w->bufD);
+    free(w->bufA); free(w->bufB); free(w->bufC); free(w->bufD); free(w->kbuf);
     free(w->tour); free(w->spPred); free(w->spDq);
     free(w->spD); free(w->spC); free(w->spP); free(w->spF); free(w->spAng);
     free(w->estack); free(w->touch); free(w->pos); free(w->ktag);
@@ -768,6 +790,31 @@ static inline void heap_push(double *hd, int *hid, int *sz, int K, double d, int
     }
 }
 
+/* Write one kNN list, nearest first. The bounded max-heap holds the K nearest
+   in heap order (farthest at 0), so it is heapsorted in place first. --vrank
+   relies on the order; it also decides which neighbour a uniform index draw
+   lands on and how ties between equal insertion costs are broken, so sorting
+   changes every trajectory without changing the law of any move. (Before
+   2026-10-19 the heap order was copied as is: the runs of the paper used
+   those unsorted lists, and --vrank then favoured the *farthest* of them.) */
+static inline void knn_out(double *hd, int *hid, int sz, int *out, int K)
+{
+    for (int end = sz - 1; end > 0; end--) {
+        double td = hd[0]; hd[0] = hd[end]; hd[end] = td;
+        int ti = hid[0]; hid[0] = hid[end]; hid[end] = ti;
+        for (int i = 0;;) {                    /* sift down within [0, end) */
+            int l = 2 * i + 1, r = l + 1, b = i;
+            if (l < end && hd[l] > hd[b]) b = l;
+            if (r < end && hd[r] > hd[b]) b = r;
+            if (b == i) break;
+            double t2 = hd[b]; hd[b] = hd[i]; hd[i] = t2;
+            int i2 = hid[b]; hid[b] = hid[i]; hid[i] = i2;
+            i = b;
+        }
+    }
+    for (int t = 0; t < K; t++) out[t] = (t < sz) ? hid[t] : 0;
+}
+
 static void knn_build(const Inst *in, WS *w, int K)
 {
     const int n = in->n;
@@ -780,8 +827,7 @@ static void knn_build(const Inst *in, WS *w, int K)
                 double dx = in->x[i] - in->x[j], dy = in->y[i] - in->y[j];
                 heap_push(w->hd, w->hid, &sz, K, dx * dx + dy * dy, j);
             }
-            int *out = w->nbr + (size_t)(i - 1) * K;
-            for (int t = 0; t < K; t++) out[t] = (t < sz) ? w->hid[t] : 0;
+            knn_out(w->hd, w->hid, sz, w->nbr + (size_t)(i - 1) * K, K);
         }
         return;
     }
@@ -864,8 +910,7 @@ static void knn_build(const Inst *in, WS *w, int K)
                 if (hd[0] <= b * b) break;
             }
         }
-        int *out = w->nbr + (size_t)(i - 1) * K;
-        for (int t = 0; t < K; t++) out[t] = (t < sz) ? hid[t] : 0;
+        knn_out(hd, hid, sz, w->nbr + (size_t)(i - 1) * K, K);
     }
     #undef CELLX
     #undef CELLY
@@ -1181,6 +1226,18 @@ static inline double bad_of(const Inst *in, const WS *w, const Sol *S, int u)
 /* bnx[u] = length of the downstream edge (u, nxt[u]) alone. Free to keep here
    (the value is computed for inc[u] anyway) and read by the informed
    insertion side of relocate (--reloc-side long). */
+/* d(x, nxt[x]) without a square root when x is a customer: bnx[x] holds
+   exactly dxy(x, nxt[x]) (same function, and dxy is symmetric bit for bit
+   since (-d)^2 == d^2), so the substitution never changes a result. Virtual
+   depots carry no bnx: they pay the dxy. */
+static inline double dnx(const WS *w, const Sol *S, int x)
+{
+    if (x <= S->n) return w->bnx[x];
+    /* x is a virtual depot: its successor is a customer (d0 holds that edge,
+       bit for bit) or x itself (empty route, length 0) */
+    return (S->nxt[x] <= S->n) ? w->d0[S->nxt[x]] : 0.0;
+}
+
 static inline void inc_upd(const Inst *in, WS *w, const Sol *S, int u)
 {
     if (u < 1 || u > S->n) return;
@@ -1409,7 +1466,7 @@ static SPEC_INLINE double mv_relocate_impl(const Inst *in, WS *w, Sol *S, int K,
 
     /* d(p,u)+d(u,sc) is already held in inc[u]: 4 square roots instead of 6 */
     double delta = dxy(w, p, sc) - w->inc[u]
-                 + dxy(w, v, u) + dxy(w, u, q) - dxy(w, v, q);
+                 + dxy(w, v, u) + dxy(w, u, q) - dnx(w, S, v);
     if (probe) { if (created) S->R--; return delta; }
     if (!sa_accept(delta, T, rng)) { if (created) S->R--; return 0.0; }
 
@@ -1453,7 +1510,7 @@ static SPEC_INLINE double mv_swap_impl(const Inst *in, WS *w, Sol *S, int K,
 
     if (su == v) {                                   /* u right before v */
         delta = dxy(w, pu, v) + dxy(w, u, sv)
-              - dxy(w, pu, u) - dxy(w, v, sv);
+              - dnx(w, S, pu) - w->bnx[v];
         if (probe) return delta;
         if (!sa_accept(delta, T, rng)) return 0.0;
         w->acc++;
@@ -1462,7 +1519,7 @@ static SPEC_INLINE double mv_swap_impl(const Inst *in, WS *w, Sol *S, int K,
         nxt[u] = sv; prv[sv] = u;
     } else if (sv == u) {                            /* v right before u */
         delta = dxy(w, pv, u) + dxy(w, v, su)
-              - dxy(w, pv, v) - dxy(w, u, su);
+              - dnx(w, S, pv) - w->bnx[u];
         if (probe) return delta;
         if (!sa_accept(delta, T, rng)) return 0.0;
         w->acc++;
@@ -1619,7 +1676,8 @@ static SPEC_INLINE double mv_swapstar_impl(const Inst *in, WS *w, Sol *S, int K,
         for (int c0 = nxt[vd]; ; c0 = nxt[c0]) {
             int b = (c0 == vd) ? vd : c0;
             if (b != u) {
-                double c = dxy(w, a, v) + dxy(w, v, b) - dxy(w, a, b);
+                double ab = (nxt[a] != b) ? dxy(w, a, b) : (a <= n) ? w->bnx[a] : (b <= n) ? w->d0[b] : 0.0;
+                double c = dxy(w, a, v) + dxy(w, v, b) - ab;
                 if (c < bi_v) { bi_v = c; aV = a; }
                 a = b;
             }
@@ -1634,7 +1692,8 @@ static SPEC_INLINE double mv_swapstar_impl(const Inst *in, WS *w, Sol *S, int K,
         for (int i2 = 0; ; i2++) {
             int b = (i2 == L2) ? vd : B0[i2];
             if (b != v) {
-                double c = dxy(w, a, u) + dxy(w, u, b) - dxy(w, a, b);
+                double ab = (nxt[a] != b) ? dxy(w, a, b) : (a <= n) ? w->bnx[a] : (b <= n) ? w->d0[b] : 0.0;
+                double c = dxy(w, a, u) + dxy(w, u, b) - ab;
                 if (c < bi_u) { bi_u = c; aU = a; }
                 a = b;
             }
@@ -1693,21 +1752,24 @@ static double mv_open(const Inst *in, WS *w, Sol *S, int K, double T,
     int p = prv[u], q = nxt[u];
     if (p == q && p > n) return 0.0;            /* u is already alone */
 
-    double delta = 2.0 * dxy(w, 0, u) + dxy(w, p, q) - w->inc[u];
+    double delta = 2.0 * w->d0[u] + dxy(w, p, q) - w->inc[u];
     if (probe) return delta;
     if (!sa_accept(delta, T, rng)) return 0.0;
 
+    /* Reuse a husk (an emptied route) before creating a route. Creating first,
+       as before 2026-10-20, left R one higher after every accepted open for the
+       rest of the chain, and the husks were walked for nothing by loads_resync
+       and sol_cost. The O(R) scan is paid on accepted opens only. Which route
+       index u lands in changes no move; it changes the order of the routes,
+       hence what Split concatenates and the order of the sum in sol_cost. */
     int r = -1;
-    if (S->R < n) {                              /* create a route */
+    for (int t = 0; t < S->R; t++)
+        if (nxt[VD(t)] == VD(t)) { r = t; break; }
+    if (r < 0) {
+        if (S->R >= n) return 0.0;               /* every customer alone */
         r = S->R++;
         int vd = VD(r);
         nxt[vd] = prv[vd] = vd; rid[vd] = r; S->load[r] = 0.0;
-    } else {                                     /* otherwise reuse a husk */
-        /* O(R), but only reachable once R == n, i.e. every customer alone on
-           its route; R stays far below n on anything realistic */
-        for (int t = 0; t < S->R; t++)
-            if (nxt[VD(t)] == VD(t)) { r = t; break; }
-        if (r < 0) return 0.0;
     }
     w->acc++;
     int ru = rid[u];
@@ -1744,7 +1806,7 @@ static SPEC_INLINE double mv_2opt_impl(const Inst *in, WS *w, Sol *S, int K,
         int sa = nxt[a], sb = nxt[b];
         if (sa == b || sb == a) return 0.0;          /* empty segment */
         double delta = dxy(w, a, b) + dxy(w, sa, sb)
-                     - dxy(w, a, sa) - dxy(w, b, sb);
+                     - dnx(w, S, a) - dnx(w, S, b);
         if (probe) return delta;
         if (!sa_accept(delta, T, rng)) return 0.0;
         w->acc++;
@@ -1762,11 +1824,11 @@ static SPEC_INLINE double mv_2opt_impl(const Inst *in, WS *w, Sol *S, int K,
             /* the reversal swaps upstream and downstream: bnx must follow,
                otherwise relocate's informed insertion side reads the edge
                from before (inc[] is invariant: sum of the two edges) */
-            if (w->need_bnx && p >= 1 && p <= n) w->bnx[p] = dxy(w, p, buf[t]);
+            if (p >= 1 && p <= n) w->bnx[p] = dxy(w, p, buf[t]);
             p = buf[t];
         }
         nxt[p] = sb; prv[sb] = p;
-        if (w->need_bnx && p >= 1 && p <= n) w->bnx[p] = dxy(w, p, sb);
+        if (p >= 1 && p <= n) w->bnx[p] = dxy(w, p, sb);
         {
             inc_upd(in, w, S, a);  inc_upd(in, w, S, sa);
             inc_upd(in, w, S, b);  inc_upd(in, w, S, sb);
@@ -1777,7 +1839,7 @@ static SPEC_INLINE double mv_2opt_impl(const Inst *in, WS *w, Sol *S, int K,
     /* ---- 2-opt*: exchange the tails of the two routes ---- */
     int sa = nxt[a], sb = nxt[b];
     double delta = dxy(w, a, sb) + dxy(w, b, sa)
-                 - dxy(w, a, sa) - dxy(w, b, sb);
+                 - dnx(w, S, a) - dnx(w, S, b);
     if (!probe && !sa_accept(delta, T, rng)) return 0.0;
 
     int *A = w->bufA, *B = w->bufB, *NA = w->bufC, *NB = w->bufD;
@@ -1817,19 +1879,60 @@ static SPEC_INLINE double mv_2opt_impl(const Inst *in, WS *w, Sol *S, int K,
  * its gains vanish as the annealing converges. This one removes a few
  * contiguous *strings* of customers -- the tournament-selected seed's own
  * string, then strings around its kNN, which are in other routes -- and
- * greedily reinserts them at their cheapest feasible position. That is exactly
+ * greedily reinserts them at their cheapest feasible position (or, with
+ * --kick-repair 1/2, at their cheapest position regardless of capacity, the
+ * overloaded routes being repaired afterwards). That is exactly
  * the multi-route rearrangement relocate/swap/2-opt* cannot cross once the
  * temperature is low, and it stays classical, feasible and verifiable.
  *
  * Cost O(k*(K + L)) for k removed customers, hence the period. The whole
  * thing is one move: the total delta faces sa_accept once, and a rejection
- * (or a customer that cannot be reinserted anywhere) rolls the solution back
- * exactly, by undoing the insertions and then the removals in reverse order --
- * each splice is restored in the state its two endpoints had when it was made.
+ * (or a customer that cannot be reinserted anywhere, or a repair that finds
+ * no move) rolls the solution back exactly, by replaying a journal of every
+ * unlink and link backwards -- each splice is restored in the state its two
+ * endpoints had when it was made. Without a repair the journal holds the
+ * removals then the insertions, and the replay is the old undo, step for step.
  */
 
 #define KICK_MAXK 64
+/* journal: k removals + k insertions + 2 entries per repair move, and a
+   repair makes at most 3k moves (port of the supervisor's kick-repair.diff,
+   2026-10-21) */
+#define KICK_JMAX (8 * KICK_MAXK)
 
+/* --kick-repair: the best move out of the overloaded route r found so far,
+   kept separately among the customers whose demand covers the excess
+   ("eligible": one move makes r feasible), which are preferred */
+typedef struct { double bE, bA; int xE, aE, xA, aA; } RepBest;
+
+/* try customer x (removal delta rem) next to each of its kk nearest
+   neighbours outside r; returns 1 if some position is feasible */
+static inline int repair_try(const Inst *in, WS *w, const Sol *S, int K, int kk,
+                             int r, int x, double rem, int el, RepBest *b)
+{
+    const int *nxt = S->nxt, *rid = S->rid;
+    const int *nb = w->nbr + (size_t)(x - 1) * K;
+    int found = 0;
+    for (int e = 0; e < kk; e++) {
+        int v = nb[e];
+        if (v < 1) continue;
+        int rv = rid[v];
+        if (rv == r || S->load[rv] + in->dem[x] > in->cap + EPS) continue;
+        int q = nxt[v];
+        double net = rem + dxy(w, v, x) + dxy(w, x, q) - dxy(w, v, q);
+        if (net < b->bA) { b->bA = net; b->xA = x; b->aA = v; }
+        if (el && net < b->bE) { b->bE = net; b->xE = x; b->aE = v; }
+        found = 1;
+    }
+    return found;
+}
+
+#ifdef CW_CHECK
+/* --kick-early under -DCW_CHECK: the recreate is completed anyway, and a kick
+   abandoned early that the full recreate would have had accepted with the same
+   threshold is counted as lost. Must stay 0 (reported at exit). */
+static long ck_kick_early, ck_kick_lost;
+#endif
 __attribute__((noinline))
 static double mv_kick(const Inst *in, WS *w, Sol *S, int K, double T, Rng *rng)
 {
@@ -1837,8 +1940,12 @@ static double mv_kick(const Inst *in, WS *w, Sol *S, int K, double T, Rng *rng)
     int *nxt = S->nxt, *prv = S->prv, *rid = S->rid;
     if (n < 3) return 0.0;
 
-    int rc[KICK_MAXK], rp[KICK_MAXK], rq[KICK_MAXK], rr[KICK_MAXK], ri[KICK_MAXK];
-    int nrem = 0, nins = 0;
+    /* every unlink (ins = 0) and link (ins = 1) is journaled in order: a
+       rejected kick is undone by replaying the journal backwards */
+    int jc[KICK_JMAX], jp[KICK_JMAX], jq[KICK_JMAX], jr[KICK_JMAX];
+    char jins[KICK_JMAX];
+    int rc[KICK_MAXK], rp[KICK_MAXK];           /* the removed, in order */
+    int nj = 0, nrem = 0;
     double delta = 0.0;
     const int want = 1 + rng_idx(rng, w->kick_max);
     if (++w->kick_gen == 0) {                    /* wrapped: 0 means "present" */
@@ -1857,20 +1964,36 @@ static double mv_kick(const Inst *in, WS *w, Sol *S, int K, double T, Rng *rng)
         int len = 1 + rng_idx(rng, want - nrem);
         for (int t = 0; t < len && nrem < want; t++) {
             if (c < 1 || c > n || w->ktag[c] == gen) break;
-            int p = prv[c], q = nxt[c], r = rid[c], nx = q;
+            int p = prv[c], q = nxt[c], r = rid[c];
             delta += dxy(w, p, q) - dxy(w, p, c) - dxy(w, c, q);
             nxt[p] = q; prv[q] = p;
             S->load[r] -= in->dem[c];
             w->ktag[c] = gen;
-            rc[nrem] = c; rp[nrem] = p; rq[nrem] = q; rr[nrem] = r; nrem++;
-            c = nx;
+            jc[nj] = c; jp[nj] = p; jq[nj] = q; jr[nj] = r; jins[nj++] = 0;
+            rc[nrem] = c; rp[nrem] = p; nrem++;
+            c = q;
         }
     }
     if (!nrem) return 0.0;
 
-    /* --- recreate: cheapest feasible insertion among each customer's kNN --- */
+    /* --- recreate: cheapest insertion among each customer's kNN, feasible
+       only with --kick-repair 0 --- */
+    const int repair = (K > 0) ? w->kick_repair : 0;
     int ok = 1;
     const int ncand = (K > 0) ? K : 8;
+    /* --kick-early: the Metropolis threshold is drawn first (same law as
+       sa_accept: accept iff delta <= -T ln U). An insertion never costs less
+       than -slack (0 by the triangle inequality, -1 with TSPLIB rounding), so
+       once the partial delta exceeds the threshold by more than the slack
+       still available, the kick is lost and is abandoned early. Exact with
+       --kick-repair 0; with a repair, which may still lower the delta, the
+       abandon is an approximation (the supervisor measured that it pays). */
+    const double slack = in->rounded ? 1.0 : 1e-9;
+    const double thr = (w->kick_early && T > 0.0) ? -T * log(1.0 - rng_unit(rng)) : 0.0;
+    int over[KICK_MAXK], nover = 0;              /* routes that received a customer */
+#ifdef CW_CHECK
+    int early = 0;
+#endif
     for (int t = 0; t < nrem && ok; t++) {
         int c = rc[t];
         double bd = 1e300;
@@ -1885,7 +2008,7 @@ static double mv_kick(const Inst *in, WS *w, Sol *S, int K, double T, Rng *rng)
             if (v <= n && w->ktag[v] == gen) continue;     /* itself removed */
             int r = rid[v];
             if (r < 0 || r >= S->R) continue;
-            if (S->load[r] + in->dem[c] > in->cap + EPS) continue;
+            if (!repair && S->load[r] + in->dem[c] > in->cap + EPS) continue;
             int b = nxt[v];
             double d = dxy(w, v, c) + dxy(w, c, b) - dxy(w, v, b);
             if (d < bd) { bd = d; ba = v; }
@@ -1899,32 +2022,114 @@ static double mv_kick(const Inst *in, WS *w, Sol *S, int K, double T, Rng *rng)
         nxt[ba] = c; prv[c] = ba; nxt[c] = b; prv[b] = c;
         rid[c] = r; S->load[r] += in->dem[c];
         w->ktag[c] = 0;                        /* back in the solution */
-        ri[nins++] = c;
+        jc[nj] = c; jp[nj] = ba; jq[nj] = b; jr[nj] = r; jins[nj++] = 1;
         delta += bd;
+        if (repair) {
+            int k = 0;
+            while (k < nover && over[k] != r) k++;
+            if (k == nover) over[nover++] = r;
+        }
+#ifdef CW_CHECK
+        if (w->kick_early && delta - slack * (nrem - 1 - t) > thr) early = 1;
+#else
+        if (w->kick_early && delta - slack * (nrem - 1 - t) > thr) { ok = 0; break; }
+#endif
+    }
+#ifdef CW_CHECK
+    /* with a repair the early abandon is not exact: not counted as lost */
+    if (early) { ck_kick_early++; if (!repair && ok && delta <= thr) ck_kick_lost++; ok = 0; }
+#endif
+
+    /* --- repair (--kick-repair 1 or 2): while a route that received a
+       customer is overloaded, move one of its customers to the cheapest
+       feasible position next to one of its nearest neighbours in another
+       route; a customer whose demand covers the excess is preferred. Fails
+       (the kick is undone) when no customer can move. --- */
+    for (int moves = 0; ok && repair; moves++) {
+        int r = -1;
+        for (int k = 0; k < nover; k++)
+            if (S->load[over[k]] > in->cap + EPS) { r = over[k]; break; }
+        if (r < 0) break;
+        if (moves >= 3 * w->kick_max) { ok = 0; break; }
+        const double ex = S->load[r] - in->cap;
+        RepBest best = { 1e300, 1e300, -1, -1, -1, -1 };
+        int *X = w->bufD, L = 0;
+        double *R = w->kbuf;
+        for (int x = nxt[VD(r)]; x != VD(r); x = nxt[x]) {
+            int p = prv[x], q = nxt[x];
+            R[L] = dxy(w, p, q) - dxy(w, p, x) - dxy(w, x, q);   /* removal delta */
+            X[L++] = x;
+        }
+        if (repair == 1) {                     /* every customer of r */
+            for (int k = 0; k < L; k++)
+                repair_try(in, w, S, K, K, r, X[k], R[k], in->dem[X[k]] >= ex - EPS, &best);
+        } else {
+            /* the worst placed first (most negative removal delta), the
+               eligible ones before the others, until repair_top customers
+               have a feasible move: a partial selection, O(L) per pick */
+            const int kk = (w->repair_k < K) ? w->repair_k : K;
+            int m = 0, found = 0;
+            for (int el = 1; el >= 0 && !(el == 0 && best.xE >= 0); el--) {
+                while (found < w->repair_top) {
+                    int ks = -1;
+                    for (int k = m; k < L; k++)
+                        if ((in->dem[X[k]] >= ex - EPS) == el && (ks < 0 || R[k] < R[ks])) ks = k;
+                    if (ks < 0) break;
+                    int x = X[ks]; double rm = R[ks];
+                    /* an insertion costs >= -slack: once the removal delta
+                       alone cannot beat the best move, nothing later can */
+                    if (rm - slack >= (el ? best.bE : best.bA)) break;
+                    X[ks] = X[m]; R[ks] = R[m]; X[m] = x; R[m] = rm; m++;
+                    found += repair_try(in, w, S, K, kk, r, x, rm, el, &best);
+                }
+            }
+        }
+        int x = (best.xE >= 0) ? best.xE : best.xA;
+        int a = (best.xE >= 0) ? best.aE : best.aA;
+        if (x < 0) { ok = 0; break; }
+        delta += (best.xE >= 0) ? best.bE : best.bA;
+        int p = prv[x], q = nxt[x];
+        nxt[p] = q; prv[q] = p;
+        S->load[r] -= in->dem[x];
+        jc[nj] = x; jp[nj] = p; jq[nj] = q; jr[nj] = r; jins[nj++] = 0;
+        int b = nxt[a], ra = rid[a];
+        nxt[a] = x; prv[x] = a; nxt[x] = b; prv[b] = x;
+        rid[x] = ra; S->load[ra] += in->dem[x];
+        jc[nj] = x; jp[nj] = a; jq[nj] = b; jr[nj] = ra; jins[nj++] = 1;
     }
 
     /* --- accept, or roll back exactly --- */
-    if (!ok || !sa_accept(delta, T, rng)) {
-        for (int t = nins - 1; t >= 0; t--) {           /* undo insertions */
-            int c = ri[t], p = prv[c], q = nxt[c];
-            nxt[p] = q; prv[q] = p;
-            S->load[rid[c]] -= in->dem[c];
-        }
-        for (int t = nrem - 1; t >= 0; t--) {           /* undo removals */
-            int c = rc[t], p = rp[t], q = rq[t];
-            nxt[p] = c; prv[c] = p; nxt[c] = q; prv[q] = c;
-            rid[c] = rr[t]; S->load[rr[t]] += in->dem[c];
-            w->ktag[c] = 0;
+    if (!ok || (w->kick_early ? (delta > thr) : !sa_accept(delta, T, rng))) {
+        for (int t = nj - 1; t >= 0; t--) {
+            int c = jc[t];
+            if (jins[t]) {
+                int p = prv[c], q = nxt[c];
+                nxt[p] = q; prv[q] = p;
+                S->load[jr[t]] -= in->dem[c];
+            } else {
+                int p = jp[t], q = jq[t];
+                nxt[p] = c; prv[c] = p; nxt[c] = q; prv[q] = c;
+                rid[c] = jr[t]; S->load[jr[t]] += in->dem[c];
+                w->ktag[c] = 0;
+            }
         }
         return 0.0;
     }
 
-    for (int t = 0; t < nrem; t++) {                    /* refresh what moved */
-        int c = rc[t];
-        inc_upd(in, w, S, rp[t]); inc_upd(in, w, S, rq[t]);
-        inc_upd(in, w, S, prv[c]); inc_upd(in, w, S, c); inc_upd(in, w, S, nxt[c]);
-        if (w->empty_thr) empty_push(w, S, rr[t]);
-    }
+    if (!repair) {                                      /* refresh what moved */
+        for (int t = 0; t < nrem; t++) {                /* (as before, same order) */
+            int c = jc[t];
+            inc_upd(in, w, S, jp[t]); inc_upd(in, w, S, jq[t]);
+            inc_upd(in, w, S, prv[c]); inc_upd(in, w, S, c); inc_upd(in, w, S, nxt[c]);
+            if (w->empty_thr) empty_push(w, S, jr[t]);
+        }
+    } else
+        for (int t = 0; t < nj; t++) {
+            int c = jc[t];
+            inc_upd(in, w, S, jp[t]); inc_upd(in, w, S, jq[t]);
+            inc_upd(in, w, S, prv[c]); inc_upd(in, w, S, c); inc_upd(in, w, S, nxt[c]);
+            if (!jins[t] && w->empty_thr) empty_push(w, S, jr[t]);
+        }
     return delta;
 }
 
@@ -2102,6 +2307,18 @@ static SPEC_INLINE double sa_draw_spec(const Inst *in, WS *w, const Opts *o,
                                        int probe, const int spec)
 {
     (void)o;                    /* the operator mix lives in w->th1..th5 */
+    if (w->cyc_len && !probe && !(spec && w->feat)) {   /* --op-cycle */
+        int op = w->cyc[w->cyc_i];
+        if (++w->cyc_i == w->cyc_len) w->cyc_i = 0;
+        switch (op) {
+        case 0:  return mv_relocate(in, w, S, K, T, rng, probe);
+        case 1:  return mv_swap    (in, w, S, K, T, rng, probe);
+        case 2:  return mv_2opt    (in, w, S, K, T, rng, probe);
+        case 3:  return mv_oropt   (in, w, S, K, T, rng, probe);
+        case 4:  return mv_swapstar(in, w, S, K, T, rng, probe);
+        default: return mv_open    (in, w, S, K, T, rng, probe);
+        }
+    }
     uint32_t z = rng32(rng);
     if (spec && w->feat) {      /* --dlb and/or --empty-p are on */
         if (z < w->th1) return mv_relocate_x(in, w, S, K, T, rng, probe);
@@ -2234,6 +2451,25 @@ static int sa_config(const Inst *in, WS *w, const Opts *o, int n, int R,
         double c3 = c2 + o->w_2opt / wt, c4 = c3 + o->w_or / wt;
         double c5 = c4 + o->w_sstar / wt;
         w->th1 = op_thr(c1); w->th2 = op_thr(c2); w->th3 = op_thr(c3);
+        w->cyc_len = 0;
+        if (o->op_cycle) {
+            /* --op-cycle: the operators in a fixed cycle that respects the
+               weights (smooth weighted round robin), instead of one random
+               draw per step; the weights are rounded to multiples of the
+               smallest positive one */
+            double wv[6] = { o->w_rel, o->w_swap, o->w_2opt, o->w_or, o->w_sstar, o->w_open };
+            double mn = 1e300; int cnt[6], len = 0;
+            for (int k = 0; k < 6; k++) if (wv[k] > 0 && wv[k] < mn) mn = wv[k];
+            for (int k = 0; k < 6; k++) { cnt[k] = (wv[k] > 0) ? (int)floor(wv[k] / mn + 0.5) : 0; len += cnt[k]; }
+            if (len > 2048) die("--op-cycle: operator weights too uneven (cycle > 2048)");
+            int cur[6] = {0};
+            for (int t = 0; t < len; t++) {
+                int b = -1;
+                for (int k = 0; k < 6; k++) { cur[k] += cnt[k]; if (cnt[k] && (b < 0 || cur[k] > cur[b])) b = k; }
+                cur[b] -= len; w->cyc[t] = (unsigned char)b;
+            }
+            w->cyc_len = len; w->cyc_i = 0;
+        }
         w->th4 = op_thr(c4); w->th5 = op_thr(c5);
         if (o->w_open  <= 0.0) w->th5 = 0xFFFFFFFFu;
         if (o->w_sstar <= 0.0 && o->w_open <= 0.0) w->th4 = 0xFFFFFFFFu;
@@ -2265,6 +2501,8 @@ static int sa_config(const Inst *in, WS *w, const Opts *o, int n, int R,
     w->dlb_win = (long)o->dlb * (long)n;
     w->step = 0;
     w->kick_max = o->kick_max;
+    w->kick_early = o->kick_early;
+    w->kick_repair = o->kick_repair; w->repair_top = o->repair_top; w->repair_k = o->repair_k;
     w->feat = (o->dlb > 0 ? 1 : 0) | (w->empty_thr ? 2 : 0);
     return K;
 }
@@ -2312,6 +2550,76 @@ static void chain_wall_temp(Chain *c)
     c->T = c->T0 * pow(c->Tend / c->T0, c->frac);
 }
 
+/* -DCW_CHECK (make check): after every step that changed the solution, rebuild
+   from scratch everything the moves maintain incrementally and abort on the
+   first mismatch -- links, rid, loads and capacity, inc[], bnx[] (always read),
+   bad[] (when read) and the running cost. Also tracks the route count R and
+   the husks (empty routes below R), reported at exit. O(n + R) per check:
+   a test build, never for timing. Run it with --threads 1 (the counters are
+   plain globals). */
+#ifdef CW_CHECK
+static long ck_checks, ck_maxR, ck_maxhusk, ck_lastR, ck_lasthusk;
+static void ck_report(void)
+{
+    fprintf(stderr, "CW_CHECK: %ld checks passed; R max %ld, husks max %ld; "
+            "last R %ld, husks %ld; kick-early %ld abandoned, %ld lost\n", ck_checks,
+            ck_maxR, ck_maxhusk, ck_lastR, ck_lasthusk, ck_kick_early, ck_kick_lost);
+}
+#define CK_FAIL(...) do { fprintf(stderr, "CW_CHECK failed (check %ld): ", ck_checks); \
+                          fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); abort(); } while (0)
+static void check_invariants(const Inst *in, const WS *w, const Sol *S, double cur)
+{
+    static int registered;
+    if (!registered) { registered = 1; atexit(ck_report); }
+    const int n = S->n;
+    int *seen = w->seen;                       /* scratch, n + 1 ints */
+    memset(seen, 0, (size_t)(n + 1) * sizeof(int));
+    long husk = 0, cnt = 0;
+    double cost = 0.0;
+    if (S->R < 0 || S->R > n + 2) CK_FAIL("R = %d out of range", S->R);
+    for (int r = 0; r < S->R; r++) {
+        const int vd = VD(r);
+        if (S->rid[vd] != r) CK_FAIL("rid[VD(%d)] = %d", r, S->rid[vd]);
+        if (S->nxt[vd] == vd) {
+            if (S->prv[vd] != vd) CK_FAIL("husk %d: prv != self", r);
+            if (S->load[r] != 0.0) CK_FAIL("husk %d: load %g", r, S->load[r]);
+            husk++; continue;
+        }
+        double load = 0.0;
+        int L = 0;
+        for (int t = vd; ; ) {
+            int u = S->nxt[t];
+            if (S->prv[u] != t) CK_FAIL("prv[nxt[%d]] != %d (route %d)", t, t, r);
+            cost += dsol(in, n, t, u);
+            if (u == vd) break;
+            if (u < 1 || u > n) CK_FAIL("route %d visits node %d", r, u);
+            if (seen[u]++) CK_FAIL("customer %d visited twice", u);
+            if (S->rid[u] != r) CK_FAIL("rid[%d] = %d, route %d", u, S->rid[u], r);
+            if (++L > n) CK_FAIL("route %d: cycle without its depot", r);
+            load += in->dem[u];
+            t = u;
+        }
+        if (fabs(load - S->load[r]) > 1e-9 * (1.0 + load))
+            CK_FAIL("route %d: load %.17g, stored %.17g", r, load, S->load[r]);
+        if (load > in->cap + EPS) CK_FAIL("route %d: load %g > Q = %g", r, load, in->cap);
+        cnt += L;
+    }
+    if (cnt != n) CK_FAIL("%ld customers routed, n = %d", cnt, n);
+    for (int u = 1; u <= n; u++) {
+        double dn = dxy(w, u, S->nxt[u]), ic = dxy(w, S->prv[u], u) + dn;
+        if (w->inc[u] != ic) CK_FAIL("inc[%d] = %.17g, fresh %.17g", u, w->inc[u], ic);
+        if (w->bnx[u] != dn) CK_FAIL("bnx[%d] = %.17g, fresh %.17g", u, w->bnx[u], dn);
+        if (w->pick_t != 1 && w->bad[u] != bad_of(in, w, S, u)) CK_FAIL("bad[%d] stale", u);
+    }
+    if (fabs(cost - cur) > 1e-6 * (1.0 + cost))
+        CK_FAIL("running cost %.17g, fresh %.17g", cur, cost);
+    ck_checks++;
+    ck_lastR = S->R; ck_lasthusk = husk;
+    if (S->R > ck_maxR) ck_maxR = S->R;
+    if (husk > ck_maxhusk) ck_maxhusk = husk;
+}
+#endif
+
 /* One step of a chain (operator, periodic Split, best-so-far snapshot,
    temperature, racing checkpoint). Assumes the chain is bound. */
 
@@ -2323,6 +2631,10 @@ static SPEC_INLINE void chain_step(const Inst *in, WS *w, const Opts *o, Chain *
                               size_t zi, size_t zd, int *nalive,
                               const int spec)
 {
+#ifdef CW_CHECK
+    const double ck_cur = c->cur;
+    const long ck_acc = w->acc;
+#endif
     c->cur += sa_draw_spec(in, w, o, &c->sol, K, c->T, &c->rng, 0, spec);
 
     /* wipe the ULP drift of the incremental load updates (see loads_resync);
@@ -2342,6 +2654,10 @@ static SPEC_INLINE void chain_step(const Inst *in, WS *w, const Opts *o, Chain *
         if (p >= 0.0) { w->gsplit += c->cur - p; c->cur = p;
                         inc_build(in, w, &c->sol); }
     }
+#ifdef CW_CHECK
+    if (c->cur != ck_cur || w->acc != ck_acc || ((it + 1) & 1023) == 0)
+        check_invariants(in, w, &c->sol, c->cur);
+#endif
     if (c->cur < c->best - 1e-12) {
         c->best = c->cur;
         c->bR = c->sol.R;
@@ -2458,6 +2774,634 @@ static double chain_finish(const Inst *in, WS *w, Chain *c)
         inc_build(in, w, &c->sol);
     }
     return c->best;
+}
+
+
+/* =========================================================================
+ *  --elim F: route elimination at the end of the run.
+ *
+ *  After the restarts, the lightest route of the best solution is emptied
+ *  and its customers go to an ejection pool, as in Nagata & Braysy (2009).
+ *  The pool is emptied last in first out. A customer v either
+ *    - takes the cheapest feasible position in any other non-empty route, or
+ *    - is inserted at its cheapest position in a route holding one of its
+ *      kNN, after ejecting from that route a set E of at most --elim-kmax
+ *      customers whose demand covers the excess (no subset of E does).
+ *      E goes back to the pool and p(v), the number of times v forced an
+ *      ejection, grows by one.
+ *  Mode 1 is the original rule: a feasible position whenever there is one,
+ *  otherwise the set E of smallest sum of p, then of smallest cost. On
+ *  tightly loaded instances it often puts a customer far away, and the
+ *  solution with one route fewer costs 5 to 25 % more. Mode 2 chooses by
+ *  cost: an ejection is scored by the change of length, plus, for each
+ *  ejected customer, its cheapest insertion next to one of its kNN in another
+ *  route (capacity ignored) and sigma * (p - 1), where sigma is --elim-sigma
+ *  times the mean nearest-neighbour distance; it is taken when it beats the
+ *  best feasible position. The attempt fails after --elim-iter * n
+ *  insertions, or when no route is left below the bound ceil(sum q / Q).
+ *
+ *  Ported from the supervisor's savant-elim.diff (2026-10-21), with one
+ *  change: F is a share of the budget, as for --pursue, so the total stays
+ *  that of the run. The starts get (1-F) S steps each (or 1-F of --sa-wall),
+ *  and the phase F R S steps (or the time left), shared equally by the
+ *  re-annealed levels. They start from the solution with one route fewer
+ *  (every level under mode 3, --elim-levels 1), or from the best one if the
+ *  elimination failed, without the `open` operator, from --elim-thi2 (resp. --elim-thi)
+ *  times the final temperature of the best restart down to it. The result
+ *  replaces the best only if it is cheaper. Mode 0 runs this re-anneal alone
+ *  and serves as a control.
+ * ========================================================================= */
+
+typedef struct {
+    int    *ep, nep;          /* ejection pool (stack)                    */
+    int    *pen;              /* p(v)                                     */
+    int    *arr;              /* customers of one route                   */
+    double *sc;               /* their score: p (mode 1) or the estimate   */
+    int    *mark, stamp;      /* candidate routes already examined        */
+    double  sigma;
+} Elim;
+
+typedef struct { double P, cost; int r, k, g[3]; } EjBest;
+
+static inline void el_unlink(const Inst *in, Sol *S, int u)
+{
+    int p = S->prv[u], q = S->nxt[u];
+    S->nxt[p] = q; S->prv[q] = p;
+    S->load[S->rid[u]] -= in->dem[u];
+    S->rid[u] = -1;
+}
+
+static inline void el_link(const Inst *in, Sol *S, int a, int v)
+{
+    int b = S->nxt[a], r = S->rid[a];
+    S->nxt[a] = v; S->prv[v] = a; S->nxt[v] = b; S->prv[b] = v;
+    S->rid[v] = r; S->load[r] += in->dem[v];
+}
+
+/* cheapest position of v in route r: returns the predecessor, cost in *pc */
+static int el_best_pos(const WS *w, const Sol *S, int r, int v, double *pc)
+{
+    const int n = S->n;
+    int vd = VD(r), bp = vd;
+    double bc = 1e300;
+    for (int a = vd; ; ) {
+        int b = S->nxt[a];
+        double c = dxy(w, a, v) + dxy(w, v, b) - dxy(w, a, b);
+        if (c < bc) { bc = c; bp = a; }
+        if (b == vd) break;
+        a = b;
+    }
+    *pc = bc;
+    return bp;
+}
+
+/* change of length when the positions g[0..k) (increasing) of arr[0..L)
+   leave the route closed by vd and v takes its cheapest position */
+static double el_move_cost(const WS *w, const int *arr, int L, int vd,
+                           const int *g, int k, int v)
+{
+    double d = 0.0, bc = 1e300;
+    int a = vd, t = 0;
+    for (int i = 0; i <= L; i++) {
+        if (t < k && i == g[t]) { t++; continue; }
+        int b = (i < L) ? arr[i] : vd;
+        double c = dxy(w, a, v) + dxy(w, v, b) - dxy(w, a, b);
+        if (c < bc) bc = c;
+        a = b;
+    }
+    for (t = 0; t < k; ) {                      /* runs of consecutive positions */
+        int s = g[t], e = s;
+        while (t + 1 < k && g[t + 1] == e + 1) { t++; e++; }
+        int a0 = (s > 0) ? arr[s - 1] : vd, b0 = (e < L - 1) ? arr[e + 1] : vd;
+        d += dxy(w, a0, b0) - dxy(w, a0, arr[s]) - dxy(w, arr[e], b0);
+        for (int i = s; i < e; i++) d -= dxy(w, arr[i], arr[i + 1]);
+        t++;
+    }
+    return d + bc;
+}
+
+/* mode 2: cheapest insertion of e next to one of its kNN in a route other
+   than r and the victim, capacity ignored */
+static double el_est(const WS *w, const Sol *S, int K, int e, int r, int victim)
+{
+    const int n = S->n;
+    const int *nb = w->nbr + (size_t)(e - 1) * K;
+    double bc = 2.0 * w->d0[e];
+    for (int t = 0; t < K; t++) {
+        int x = nb[t];
+        if (x < 1 || x > n) continue;
+        int rx = S->rid[x];
+        if (rx < 0 || rx == r || rx == victim) continue;
+        int p = S->prv[x], q = S->nxt[x];
+        double dex = dxy(w, e, x);
+        double c1 = dxy(w, p, e) + dex - dxy(w, p, x);
+        double c2 = dex + dxy(w, e, q) - dxy(w, x, q);
+        if (c1 < bc) bc = c1;
+        if (c2 < bc) bc = c2;
+    }
+    return bc;
+}
+
+static inline void ej_offer(EjBest *b, int mode, double P, double c, int r,
+                            const int *g, int k)
+{
+    if (mode == 2) { P += c; c = P; }        /* a single criterion */
+    if (P < b->P || (P == b->P && c < b->cost - 1e-9)) {
+        b->P = P; b->cost = c; b->r = r; b->k = k;
+        for (int t = 0; t < k; t++) b->g[t] = g[t];
+    }
+}
+
+/* the ejections of route r that make room for v */
+static void el_route_ej(const Inst *in, const WS *w, const Sol *S, Elim *E,
+                        int K, int r, int v, int victim, int kmax, int mode,
+                        EjBest *b)
+{
+    const int n = S->n;
+    const int vd = VD(r), L = route_get(S, r, E->arr);
+    const int *arr = E->arr;
+    const double *dm = in->dem;
+    const double need = S->load[r] + dm[v] - in->cap - EPS;
+    if (need <= 0.0) return;
+    double *x = E->sc;
+    for (int i = 0; i < L; i++)
+        x[i] = (mode == 2) ? el_est(w, S, K, arr[i], r, victim)
+                             + E->sigma * (E->pen[arr[i]] - 1)
+                           : (double)E->pen[arr[i]];
+    const int prune = (mode == 1);           /* mode 1: P alone bounds the search */
+    int g[3];
+    for (int i = 0; i < L; i++) {
+        double di = dm[arr[i]];
+        if (prune && x[i] > b->P) continue;
+        if (di >= need) {
+            g[0] = i;
+            ej_offer(b, mode, x[i], el_move_cost(w, arr, L, vd, g, 1, v), r, g, 1);
+            continue;
+        }
+        if (kmax < 2) continue;
+        for (int j = i + 1; j < L; j++) {
+            double dj = dm[arr[j]], Pj = x[i] + x[j];
+            if (dj >= need || (prune && Pj > b->P)) continue;
+            g[0] = i; g[1] = j;
+            if (di + dj >= need) {
+                ej_offer(b, mode, Pj, el_move_cost(w, arr, L, vd, g, 2, v), r, g, 2);
+                continue;
+            }
+            if (kmax < 3) continue;
+            for (int k = j + 1; k < L; k++) {
+                double dk = dm[arr[k]], Pk = Pj + x[k];
+                if (di + dj + dk < need || di + dk >= need || dj + dk >= need
+                    || (prune && Pk > b->P)) continue;
+                g[2] = k;
+                ej_offer(b, mode, Pk, el_move_cost(w, arr, L, vd, g, 3, v), r, g, 3);
+            }
+        }
+    }
+}
+
+/* Empties route `victim` and reinserts its customers: 1 = success. On a
+   failure the solution is left incomplete and the caller restores it. */
+static int el_run(const Inst *in, WS *w, const Opts *o, Sol *S, Elim *E,
+                  int K, int victim, long maxit)
+{
+    const int n = S->n, mode = o->elim_mode;
+    E->nep = 0;
+    for (int u = 1; u <= n; u++) E->pen[u] = 1;
+    const int vv = VD(victim);
+    for (int t = S->nxt[vv]; t != vv; ) {
+        int nx = S->nxt[t];
+        E->ep[E->nep++] = t; S->rid[t] = -1; t = nx;
+    }
+    S->nxt[vv] = S->prv[vv] = vv; S->load[victim] = 0.0;
+
+    for (long it = 0; E->nep > 0 && it < maxit; it++) {
+        const int v = E->ep[--E->nep];
+        /* cheapest feasible position, all routes */
+        int bp = -1; double bc = 1e300;
+        for (int r = 0; r < S->R; r++) {
+            if (r == victim || S->nxt[VD(r)] == VD(r)
+                || S->load[r] + in->dem[v] > in->cap + EPS) continue;
+            double c; int p = el_best_pos(w, S, r, v, &c);
+            if (c < bc) { bc = c; bp = p; }
+        }
+        if (bp >= 0 && mode == 1) { el_link(in, S, bp, v); continue; }
+        /* ejections, in the routes of the kNN of v */
+        EjBest b = { 1e300, 1e300, -1, 0, {0, 0, 0} };
+        const int *nb = w->nbr + (size_t)(v - 1) * K;
+        E->stamp++;
+        for (int t = 0; t < K; t++) {
+            int x = nb[t];
+            if (x < 1 || x > n || S->rid[x] < 0) continue;
+            int r = S->rid[x];
+            if (r == victim || E->mark[r] == E->stamp) continue;
+            E->mark[r] = E->stamp;
+            el_route_ej(in, w, S, E, K, r, v, victim, o->elim_kmax, mode, &b);
+        }
+        if (b.r < 0 && bp < 0)            /* no neighbour routed: every route */
+            for (int r = 0; r < S->R; r++)
+                if (r != victim && S->nxt[VD(r)] != VD(r) && E->mark[r] != E->stamp)
+                    el_route_ej(in, w, S, E, K, r, v, victim, o->elim_kmax, mode, &b);
+        if (bp >= 0 && (b.r < 0 || bc <= b.P)) { el_link(in, S, bp, v); continue; }
+        if (b.r < 0) { E->ep[E->nep++] = v; return 0; }          /* stuck */
+        E->pen[v]++;
+        route_get(S, b.r, E->arr);
+        int out[3];
+        for (int t = 0; t < b.k; t++) out[t] = E->arr[b.g[t]];
+        for (int t = 0; t < b.k; t++) el_unlink(in, S, out[t]);
+        double c; int p = el_best_pos(w, S, b.r, v, &c);
+        el_link(in, S, p, v);
+        for (int t = b.k - 1; t >= 0; t--) E->ep[E->nep++] = out[t];
+    }
+    return E->nep == 0;
+}
+
+
+/* ---------------------------------------------------------------------------
+ *  --elim-mode 3: Nagata & Braysy (2009) in full.
+ *
+ *  A customer v popped from the pool goes, in this order:
+ *    1. to the cheapest feasible position of any non-empty route;
+ *    2. else through a squeeze: inserted next to one of its kNN where the
+ *       capacity excess is smallest, then a descent on the total excess
+ *       (relocate, swap, 2-opt* between an overloaded route and the routes
+ *       of the kNN of its customers; best move by excess, then length). If
+ *       the excess does not reach 0, the squeeze is undone;
+ *    3. else with ejections, as in mode 1 (--elim-ej 1) or 2.
+ *  After every insertion, --elim-perturb random feasible relocations or
+ *  swaps between routes, accepted at temperature --elim-tp x Tend (any
+ *  feasible one if <= 0, as in the original). Routes are removed one after
+ *  the other, the lightest first, until an attempt fails, --elim-max is
+ *  reached or the bound ceil(sum q / Q) is.
+ * ------------------------------------------------------------------------- */
+
+static inline double el_exc(const Inst *in, double load)
+{
+    double e = load - in->cap;
+    return e > EPS ? e : 0.0;
+}
+
+typedef struct {
+    int    *snx, *spv, *srd;      /* squeeze: snapshot of the solution  */
+    double *sld;
+    double *pre;                  /* load up to and including a customer */
+    int    *a1, *a2, *b1, *b2;    /* route buffers for 2-opt*           */
+    Rng     rng;
+    double  Tp;                   /* perturbation temperature, <= 0 = inf */
+} Nag;
+
+static void el_snap(const Sol *S, Nag *N, int save)
+{
+    const size_t zi = (size_t)(2 * S->n + 4) * sizeof(int);
+    const size_t zd = (size_t)(S->n + 2) * sizeof(double);
+    if (save) { memcpy(N->snx, S->nxt, zi); memcpy(N->spv, S->prv, zi);
+                memcpy(N->srd, S->rid, zi); memcpy(N->sld, S->load, zd); }
+    else      { memcpy(S->nxt, N->snx, zi); memcpy(S->prv, N->spv, zi);
+                memcpy(S->rid, N->srd, zi); memcpy(S->load, N->sld, zd); }
+}
+
+/* 2-opt* between the route of u and the route of x: r = r[..u] + rx[x+1..],
+   rx = rx[..x] + r[u+1..] */
+static void el_2optstar(const Inst *in, Sol *S, Nag *N, int u, int x)
+{
+    const int n = S->n;
+    int r = S->rid[u], rx = S->rid[x];
+    int L1 = route_get(S, r, N->a1), L2 = route_get(S, rx, N->a2);
+    int i = 0, j = 0;
+    while (N->a1[i] != u) i++;
+    while (N->a2[j] != x) j++;
+    int m1 = 0, m2 = 0;
+    for (int t = 0; t <= i; t++) N->b1[m1++] = N->a1[t];
+    for (int t = j + 1; t < L2; t++) N->b1[m1++] = N->a2[t];
+    for (int t = 0; t <= j; t++) N->b2[m2++] = N->a2[t];
+    for (int t = i + 1; t < L1; t++) N->b2[m2++] = N->a1[t];
+    route_set(S, in, r, N->b1, m1);
+    route_set(S, in, rx, N->b2, m2);
+    (void)n;
+}
+
+/* squeeze v in; 1 = feasible again, 0 = undone */
+static int el_squeeze(const Inst *in, WS *w, Sol *S, Nag *N, int K, int victim,
+                      int v)
+{
+    const int n = S->n;
+    const double *dm = in->dem;
+    el_snap(S, N, 1);
+    /* insertion next to a kNN: smallest excess, then length */
+    const int *nb = w->nbr + (size_t)(v - 1) * K;
+    int bp = -1; double bE = 1e300, bC = 1e300;
+    for (int t = 0; t < K; t++) {
+        int x = nb[t];
+        if (x < 1 || x > n || S->rid[x] < 0) continue;
+        int r = S->rid[x];
+        double e = el_exc(in, S->load[r] + dm[v]) - el_exc(in, S->load[r]);
+        int p = S->prv[x], q = S->nxt[x];
+        double c1 = dxy(w, p, v) + dxy(w, v, x) - dxy(w, p, x);
+        double c2 = dxy(w, x, v) + dxy(w, v, q) - dxy(w, x, q);
+        if (e < bE - EPS || (e < bE + EPS && c1 < bC)) { bE = e; bC = c1; bp = p; }
+        if (e < bE - EPS || (e < bE + EPS && c2 < bC)) { bE = e; bC = c2; bp = x; }
+    }
+    if (bp < 0) return 0;
+    el_link(in, S, bp, v);
+    (void)victim;
+    for (int it = 0; it < 100; it++) {
+        double tot = 0.0;
+        for (int r = 0; r < S->R; r++) tot += el_exc(in, S->load[r]);
+        if (tot <= 0.0) return 1;
+        for (int r = 0; r < S->R; r++) {          /* prefix loads */
+            int vd = VD(r); double l = 0.0;
+            for (int t = S->nxt[vd]; t != vd; t = S->nxt[t]) { l += dm[t]; N->pre[t] = l; }
+        }
+        int bt = -1, bu = 0, bx = 0, bpos = 0;
+        double dEb = -EPS, dCb = 1e300;
+        for (int r = 0; r < S->R; r++) {
+            if (el_exc(in, S->load[r]) <= 0.0) continue;
+            const double lr = S->load[r], er = el_exc(in, lr);
+            int vd = VD(r);
+            for (int u = S->nxt[vd]; u != vd; u = S->nxt[u]) {
+                const int pu = S->prv[u], nu = S->nxt[u];
+                const double qu = dm[u];
+                const double rem = dxy(w, pu, nu) - dxy(w, pu, u) - dxy(w, u, nu);
+                const int *nbu = w->nbr + (size_t)(u - 1) * K;
+                for (int t = 0; t < K; t++) {
+                    int x = nbu[t];
+                    if (x < 1 || x > n) continue;
+                    int rx = S->rid[x];
+                    if (rx < 0 || rx == r) continue;
+                    const double lx = S->load[rx], ex = el_exc(in, lx), qx = dm[x];
+                    const int px = S->prv[x], nx = S->nxt[x];
+                    /* relocate u next to x */
+                    double dE = el_exc(in, lr - qu) + el_exc(in, lx + qu) - er - ex;
+                    if (dE <= dEb + EPS) {
+                        double c1 = rem + dxy(w, x, u) + dxy(w, u, nx) - dxy(w, x, nx);
+                        double c2 = rem + dxy(w, px, u) + dxy(w, u, x) - dxy(w, px, x);
+                        double c = c1 < c2 ? c1 : c2;
+                        if (dE < dEb - EPS || c < dCb) {
+                            dEb = dE; dCb = c; bt = 0; bu = u; bx = x; bpos = (c1 < c2) ? x : px;
+                        }
+                    }
+                    /* swap u and x */
+                    dE = el_exc(in, lr - qu + qx) + el_exc(in, lx - qx + qu) - er - ex;
+                    if (dE <= dEb + EPS) {
+                        double c = dxy(w, pu, x) + dxy(w, x, nu) - dxy(w, pu, u) - dxy(w, u, nu)
+                                 + dxy(w, px, u) + dxy(w, u, nx) - dxy(w, px, x) - dxy(w, x, nx);
+                        if (dE < dEb - EPS || c < dCb) { dEb = dE; dCb = c; bt = 1; bu = u; bx = x; }
+                    }
+                    /* 2-opt*: tails after u and after x exchanged */
+                    double l1 = N->pre[u] + (lx - N->pre[x]), l2 = N->pre[x] + (lr - N->pre[u]);
+                    dE = el_exc(in, l1) + el_exc(in, l2) - er - ex;
+                    if (dE <= dEb + EPS) {
+                        double c = dxy(w, u, nx) + dxy(w, x, nu) - dxy(w, u, nu) - dxy(w, x, nx);
+                        if (dE < dEb - EPS || c < dCb) { dEb = dE; dCb = c; bt = 2; bu = u; bx = x; }
+                    }
+                }
+            }
+        }
+        if (bt < 0) break;                          /* local minimum */
+        if (bt == 0) { el_unlink(in, S, bu); el_link(in, S, bpos, bu); }
+        else if (bt == 1) {
+            int pu = S->prv[bu], px = S->prv[bx];
+            el_unlink(in, S, bu); el_unlink(in, S, bx);
+            el_link(in, S, px, bu); el_link(in, S, pu, bx);
+        } else el_2optstar(in, S, N, bu, bx);
+    }
+    el_snap(S, N, 0);                               /* undo */
+    return 0;
+}
+
+/* random feasible relocations / swaps between routes */
+static void el_perturb(const Inst *in, WS *w, Sol *S, Nag *N, int K, int moves)
+{
+    const int n = S->n;
+    const double *dm = in->dem, Q = in->cap + EPS;
+    for (int t = 0; t < moves; t++) {
+        int u = 1 + rng_idx(&N->rng, n);
+        if (S->rid[u] < 0) continue;
+        int x = w->nbr[(size_t)(u - 1) * K + rng_idx(&N->rng, K)];
+        if (x < 1 || x > n || S->rid[x] < 0 || S->rid[x] == S->rid[u]) continue;
+        int r = S->rid[u], rx = S->rid[x];
+        int pu = S->prv[u], nu = S->nxt[u], px = S->prv[x], nx = S->nxt[x];
+        double c;
+        int sw = rng_bit(&N->rng);
+        if (!sw) {
+            if (S->load[rx] + dm[u] > Q) continue;
+            c = dxy(w, pu, nu) - dxy(w, pu, u) - dxy(w, u, nu)
+              + dxy(w, x, u) + dxy(w, u, nx) - dxy(w, x, nx);
+        } else {
+            if (S->load[r] - dm[u] + dm[x] > Q || S->load[rx] - dm[x] + dm[u] > Q) continue;
+            c = dxy(w, pu, x) + dxy(w, x, nu) - dxy(w, pu, u) - dxy(w, u, nu)
+              + dxy(w, px, u) + dxy(w, u, nx) - dxy(w, px, x) - dxy(w, x, nx);
+        }
+        if (N->Tp > 0.0 && c > 0.0 && !(rng_unit(&N->rng) < exp(-c / N->Tp))) continue;
+        if (!sw) { el_unlink(in, S, u); el_link(in, S, x, u); }
+        else {
+            el_unlink(in, S, u); el_unlink(in, S, x);
+            el_link(in, S, px, u); el_link(in, S, pu, x);
+        }
+    }
+}
+
+static int el_run3(const Inst *in, WS *w, const Opts *o, Sol *S, Elim *E, Nag *N,
+                   int K, int victim, long maxit)
+{
+    const int n = S->n;
+    E->nep = 0;
+    for (int u = 1; u <= n; u++) E->pen[u] = 1;
+    const int vv = VD(victim);
+    for (int t = S->nxt[vv]; t != vv; ) {
+        int nx = S->nxt[t];
+        E->ep[E->nep++] = t; S->rid[t] = -1; t = nx;
+    }
+    S->nxt[vv] = S->prv[vv] = vv; S->load[victim] = 0.0;
+
+    for (long it = 0; E->nep > 0 && it < maxit; it++) {
+        const int v = E->ep[--E->nep];
+        int bp = -1; double bc = 1e300;
+        for (int r = 0; r < S->R; r++) {
+            if (S->nxt[VD(r)] == VD(r) || S->load[r] + in->dem[v] > in->cap + EPS) continue;
+            double c; int p = el_best_pos(w, S, r, v, &c);
+            if (c < bc) { bc = c; bp = p; }
+        }
+        if (bp >= 0) el_link(in, S, bp, v);
+        else if (!el_squeeze(in, w, S, N, K, victim, v)) {
+            EjBest b = { 1e300, 1e300, -1, 0, {0, 0, 0} };
+            const int *nb = w->nbr + (size_t)(v - 1) * K;
+            E->stamp++;
+            for (int t = 0; t < K; t++) {
+                int x = nb[t];
+                if (x < 1 || x > n || S->rid[x] < 0) continue;
+                int r = S->rid[x];
+                if (E->mark[r] == E->stamp) continue;
+                E->mark[r] = E->stamp;
+                el_route_ej(in, w, S, E, K, r, v, victim, o->elim_kmax, o->elim_ej, &b);
+            }
+            if (b.r < 0)
+                for (int r = 0; r < S->R; r++)
+                    if (S->nxt[VD(r)] != VD(r) && E->mark[r] != E->stamp)
+                        el_route_ej(in, w, S, E, K, r, v, victim, o->elim_kmax, o->elim_ej, &b);
+            if (b.r < 0) { E->ep[E->nep++] = v; return 0; }
+            E->pen[v]++;
+            route_get(S, b.r, E->arr);
+            int out[3];
+            for (int t = 0; t < b.k; t++) out[t] = E->arr[b.g[t]];
+            for (int t = 0; t < b.k; t++) el_unlink(in, S, out[t]);
+            double c; int p = el_best_pos(w, S, b.r, v, &c);
+            el_link(in, S, p, v);
+            for (int t = b.k - 1; t >= 0; t--) E->ep[E->nep++] = out[t];
+        }
+        el_perturb(in, w, S, N, K, o->elim_perturb);
+    }
+    return E->nep == 0;
+}
+
+/* One re-anneal of *sol (which shares its arrays with c->sol) on bud steps,
+   or until `wall_end` under --sa-wall. Returns the cost of the end state. */
+static double el_reanneal(const Inst *in, WS *w, const Opts *oe, Chain *c,
+                          Sol *sol, int K, long bud, double wall_end, uint64_t sd)
+{
+    c->sol.R = sol->R;
+    c->cur = sol_cost(in, sol);
+    c->c0 = c->cur;
+    Chain *ch[1] = { c };
+    chain_init(in, w, oe, c, K, bud, sd);
+    if (oe->sa_wall > 0.0) c->wall_end = wall_end;
+    anneal_chains(in, w, oe, ch, 1, K, bud, -1.0);
+    chain_finish(in, w, c);
+    return sol_cost(in, sol);
+}
+
+/* The final phase on the best solution, held in *sol and in w->r_*.
+   Budget: `bud` steps in all (--sa-steps), or the time left until
+   `deadline` (--sa-wall), shared equally by the re-annealed levels.
+   Steps run are added to *spent. */
+static void elim_phase(const Inst *in, WS *w, const Opts *o, Chain *c,
+                       Sol *sol, double *bestc, int *bestR, double t0,
+                       long bud, double deadline, uint64_t seed, long *spent)
+{
+    const int n = in->n;
+    const size_t zi = (size_t)(2 * n + 4) * sizeof(int);
+    const size_t zd = (size_t)(n + 2) * sizeof(double);
+    const int wall = (o->sa_wall > 0.0);
+    Opts oe = *o;
+    oe.w_open = 0.0;                          /* the count must not go back up */
+    const double Tend = t0 * pow(10.0, -o->sa_decades);
+    oe.sa_tend = Tend;
+    const int K = sa_config(in, w, &oe, n, sol->R, *bestc);
+    if (bud < 1) bud = 1;
+    const uint64_t sd = (seed ^ 0x5DEECE66DULL) + (uint64_t)(o->restarts + 1) * 0xBF58476D1CE4E5B9ULL;
+
+    /* levels[k] = solution with k + 1 routes removed */
+    int nlev = 0;
+    int *lv_nxt = NULL, *lv_prv = NULL, *lv_rid = NULL; double *lv_load = NULL;
+    const size_t si = zi / sizeof(int), sdd = zd / sizeof(double);
+    if (o->elim_mode > 0 && K > 0) {
+        double qs = 0.0;
+        for (int i = 1; i <= n; i++) qs += in->dem[i];
+        const int lbR = (int)ceil(qs / in->cap - 1e-9);
+        const int maxlev = (o->elim_mode == 3) ? o->elim_max : 1;
+        Elim E;
+        E.ep = (int *)xmalloc((size_t)(n + 2) * sizeof(int));
+        E.pen = (int *)xmalloc((size_t)(n + 2) * sizeof(int));
+        E.arr = (int *)xmalloc((size_t)(n + 2) * sizeof(int));
+        E.sc = (double *)xmalloc((size_t)(n + 2) * sizeof(double));
+        E.mark = (int *)calloc((size_t)sol->R + 1, sizeof(int));
+        if (!E.mark) die("out of memory");
+        E.stamp = 0;
+        double m = 0.0;                        /* mean nearest-neighbour distance */
+        for (int u = 1; u <= n; u++) {
+            const int *nb = w->nbr + (size_t)(u - 1) * K;
+            double d = 1e300;
+            for (int t = 0; t < K; t++)
+                if (nb[t] >= 1 && nb[t] <= n && nb[t] != u) {
+                    double x = dxy(w, u, nb[t]);
+                    if (x < d) d = x;
+                }
+            if (d < 1e299) m += d;
+        }
+        E.sigma = o->elim_sigma * m / n;
+        Nag N;
+        N.snx = (int *)xmalloc(zi); N.spv = (int *)xmalloc(zi); N.srd = (int *)xmalloc(zi);
+        N.sld = (double *)xmalloc(zd); N.pre = (double *)xmalloc(zd);
+        N.a1 = (int *)xmalloc(zi); N.a2 = (int *)xmalloc(zi);
+        N.b1 = (int *)xmalloc(zi); N.b2 = (int *)xmalloc(zi);
+        rng_seed(&N.rng, seed * 0x94D049BB133111EBULL + 0x2545F4914F6CDD1DULL);
+        N.Tp = (o->elim_tp > 0.0) ? o->elim_tp * Tend : 0.0;
+        lv_nxt = (int *)xmalloc((size_t)maxlev * zi);
+        lv_prv = (int *)xmalloc((size_t)maxlev * zi);
+        lv_rid = (int *)xmalloc((size_t)maxlev * zi);
+        lv_load = (double *)xmalloc((size_t)maxlev * zd);
+        int *keep_nxt = (int *)xmalloc(zi), *keep_prv = (int *)xmalloc(zi), *keep_rid = (int *)xmalloc(zi);
+        double *keep_load = (double *)xmalloc(zd);
+        while (nlev < maxlev) {
+            if (wall && now_sec() >= deadline) break;
+            int act = 0, victim = -1;
+            for (int r = 0; r < sol->R; r++) {
+                if (sol->nxt[VD(r)] == VD(r)) continue;
+                act++;
+                if (victim < 0 || sol->load[r] < sol->load[victim]) victim = r;
+            }
+            if (act - 1 < lbR) break;
+            memcpy(keep_nxt, sol->nxt, zi); memcpy(keep_prv, sol->prv, zi);
+            memcpy(keep_rid, sol->rid, zi); memcpy(keep_load, sol->load, zd);
+            const long maxit = (long)(o->elim_iter * n) + 1;
+            int ok = (o->elim_mode == 3) ? el_run3(in, w, o, sol, &E, &N, K, victim, maxit)
+                                         : el_run(in, w, o, sol, &E, K, victim, maxit);
+            if (!ok) {
+                memcpy(sol->nxt, keep_nxt, zi); memcpy(sol->prv, keep_prv, zi);
+                memcpy(sol->rid, keep_rid, zi); memcpy(sol->load, keep_load, zd);
+                break;
+            }
+            memcpy(lv_nxt + nlev * si, sol->nxt, zi); memcpy(lv_prv + nlev * si, sol->prv, zi);
+            memcpy(lv_rid + nlev * si, sol->rid, zi); memcpy(lv_load + nlev * sdd, sol->load, zd);
+            nlev++;
+        }
+#ifdef CW_CHECK
+        {   int act = 0;
+            for (int r = 0; r < sol->R; r++) act += (sol->nxt[VD(r)] != VD(r));
+            fprintf(stderr, "CW_CHECK elim: %d route(s) removed, %d left, bound %d\n",
+                    nlev, act, lbR); }
+#endif
+        free(keep_nxt); free(keep_prv); free(keep_rid); free(keep_load);
+        free(E.ep); free(E.pen); free(E.arr); free(E.sc); free(E.mark);
+        free(N.snx); free(N.spv); free(N.srd); free(N.sld); free(N.pre);
+        free(N.a1); free(N.a2); free(N.b1); free(N.b2);
+    }
+
+    /* the re-anneals: from the best if nothing was removed, otherwise from
+       the last level (--elim-levels 0) or from every level, budget shared */
+    int first = 0, cnt = 1;
+    if (nlev > 0) { first = (o->elim_levels == 1) ? 0 : nlev - 1; cnt = nlev - first; }
+    for (int k = 0; k < cnt; k++) {
+        if (nlev > 0) {
+            int L = first + k;
+            memcpy(sol->nxt, lv_nxt + L * si, zi); memcpy(sol->prv, lv_prv + L * si, zi);
+            memcpy(sol->rid, lv_rid + L * si, zi); memcpy(sol->load, lv_load + L * sdd, zd);
+        } else {
+            memcpy(sol->nxt, w->r_nxt, zi); memcpy(sol->prv, w->r_prv, zi);
+            memcpy(sol->rid, w->r_rid, zi); memcpy(sol->load, w->r_load, zd);
+        }
+        sol->R = *bestR;
+        oe.sa_t0 = Tend * (nlev > 0 ? o->elim_thi2 : o->elim_thi);
+        long b = wall ? WALL_BUDGET : bud / cnt;
+        if (b < 1) b = 1;
+        double we = 0.0;
+        if (wall) {
+            double left = deadline - now_sec();
+            if (left <= 0.0) break;
+            we = now_sec() + left / (double)(cnt - k);
+        }
+        double cost = el_reanneal(in, w, &oe, c, sol, K, b, we, sd + (uint64_t)k);
+        *spent += c->spent;
+        if (w->tr_on) trace_note(w, now_sec(), cost);
+        if (cost < *bestc - 1e-9) {
+            *bestc = cost;
+            memcpy(w->r_nxt, sol->nxt, zi); memcpy(w->r_prv, sol->prv, zi);
+            memcpy(w->r_rid, sol->rid, zi); memcpy(w->r_load, sol->load, zd);
+        }
+    }
+    memcpy(sol->nxt, w->r_nxt, zi); memcpy(sol->prv, w->r_prv, zi);
+    memcpy(sol->rid, w->r_rid, zi); memcpy(sol->load, w->r_load, zd);
+    sol->R = *bestR;
+    free(lv_nxt); free(lv_prv); free(lv_rid); free(lv_load);
 }
 
 /* =========================================================================
@@ -2858,6 +3802,10 @@ static double solve_cw(const Inst *in, WS *w, const Opts *o_in,
         int nch = o->restarts - rs0; if (nch > width) nch = width;
         Chain *ch[2] = { &cA, &cB };
         long budget = o->sa_wall > 0.0 ? WALL_BUDGET : o->sa_steps;
+        if (o->pursue + o->elim_frac > 0.0 && o->sa_wall <= 0.0) {  /* starts share 1 - F */
+            budget = (long)((1.0 - o->pursue - o->elim_frac) * (double)o->sa_steps);
+            if (budget < 1) budget = 1;
+        }
         if (o->race > 0.0 && o->sa_steps > 0) {
             budget = rem / remch;
             if (budget < 1) budget = 1;
@@ -2880,7 +3828,7 @@ static double solve_cw(const Inst *in, WS *w, const Opts *o_in,
                            (seed ^ 0x5DEECE66DULL)
                            + (uint64_t)(rs0 + c) * 0xBF58476D1CE4E5B9ULL);
             if (o->sa_wall > 0.0) {          /* width is 1: --pair is refused */
-                const double left = o->sa_wall - (now_sec() - t_start);
+                const double left = o->sa_wall * (1.0 - o->pursue - o->elim_frac) - (now_sec() - t_start);
                 cA.wall_end = now_sec() + left / (double)(o->restarts - rs0);
             }
             anneal_chains(in, w, o, ch, nch, Ksa, budget, race_ref);
@@ -2926,6 +3874,45 @@ static double solve_cw(const Inst *in, WS *w, const Opts *o_in,
         rs0 += nch;
     }
 
+    /* --pursue F: the starts ran on 1 - F of the budget; the best of them is
+       annealed again on the remaining F, from a T0 recalibrated on it
+       (chain_init calibrates on the solution it is given). Under --sa-steps
+       the pursuit gets F * R * S steps, under --sa-wall the time left. */
+    if (o->pursue > 0.0 && o->sa_steps > 0 && configured) {
+        const int wall = (o->sa_wall > 0.0);
+        long pb = wall ? WALL_BUDGET : (long)(o->pursue * (double)o->restarts * (double)o->sa_steps);
+        if (pb < 1) pb = 1;
+        w->gsplit = 0.0;
+        memcpy(cA.sol.nxt, w->r_nxt, zi); memcpy(cA.sol.prv, w->r_prv, zi);
+        memcpy(cA.sol.rid, w->r_rid, zi); memcpy(cA.sol.load, w->r_load, zd);
+        cA.sol.R = bestR;
+        cA.cur = bestc; cA.c0 = bestc; cA.visited = best_visited;
+        Chain *ch1[1] = { &cA };
+        chain_init(in, w, o, &cA, Ksa, pb,
+                   (seed ^ 0x5DEECE66DULL)
+                   + (uint64_t)o->restarts * 0xBF58476D1CE4E5B9ULL);
+        if (wall) cA.wall_end = t_start + o->sa_wall;
+        anneal_chains(in, w, o, ch1, 1, Ksa, pb, -1.0);
+        double tracked = chain_finish(in, w, &cA);
+        double cost = sol_cost(in, &cA.sol);
+        if (o->split & 2) {
+            double p = split_apply(in, w, o, &cA.sol, cost);
+            if (p >= 0.0) { w->gsplit += cost - p; cost = sol_cost(in, &cA.sol); }
+        }
+        if (w->tr_on) trace_note(w, now_sec(), cost);
+        spent_sum += cA.spent;
+        if (cost < bestc) {
+            bestc = cost; bestR = cA.sol.R;
+            res->drift = fabs(cost - tracked);
+            res->acc = cA.spent ? (double)cA.acc / (double)cA.spent : 0.0;
+            res->t0 = cA.T0;
+            rbest = *res;
+            memcpy(w->r_nxt, cA.sol.nxt, zi); memcpy(w->r_prv, cA.sol.prv, zi);
+            memcpy(w->r_rid, cA.sol.rid, zi); memcpy(w->r_load, cA.sol.load, zd);
+        }
+        gsplit_tot += w->gsplit;
+    }
+
     /* steps handed back by the abandoned starts: polish the best one */
     if (o->race > 0.0 && o->sa_steps > 0 && configured
         && rem >= o->sa_steps / 10 + 1) {
@@ -2955,6 +3942,20 @@ static double solve_cw(const Inst *in, WS *w, const Opts *o_in,
             memcpy(w->r_rid, cA.sol.rid, zi); memcpy(w->r_load, cA.sol.load, zd);
         }
         gsplit_tot += w->gsplit;
+    }
+
+    /* --elim F: remove routes from the best, then re-anneal on the share F */
+    if (o->elim_frac > 0.0 && o->sa_steps > 0 && configured && rbest.t0 > 0.0) {
+        const int wall = (o->sa_wall > 0.0);
+        long eb = wall ? WALL_BUDGET
+                       : (long)(o->elim_frac * (double)o->restarts * (double)o->sa_steps);
+        memcpy(sol.nxt, w->r_nxt, zi); memcpy(sol.prv, w->r_prv, zi);
+        memcpy(sol.rid, w->r_rid, zi); memcpy(sol.load, w->r_load, zd);
+        sol.R = bestR;
+        cA.sol = sol;
+        w->gsplit = 0.0;
+        elim_phase(in, w, o, &cA, &sol, &bestc, &bestR, rbest.t0, eb,
+                   wall ? t_start + o->sa_wall : 0.0, seed, &spent_sum);
     }
 
 reduced:
@@ -3237,6 +4238,34 @@ static void usage(void)
 "                     abandoned; its steps are handed to the following starts\n"
 "                     and the remainder polishes the best one. off = disabled\n"
 "                     (default off; try 0.002)\n"
+"  --pursue F         the starts share 1 - F of the budget, then the best one\n"
+"                     is annealed again on the remaining F, from a T0\n"
+"                     recalibrated on it. Under --sa-steps S the starts get\n"
+"                     (1-F) S steps each and the pursuit F R S (default 0 = off)\n"
+"  --elim F           final phase on the share F of the budget (the starts get\n"
+"                     1 - F, as with --pursue): remove routes from the best\n"
+"                     solution through an ejection pool (Nagata & Braysy\n"
+"                     2009), then anneal from the result (or the best, if\n"
+"                     nothing was removed) without `open`, from a low\n"
+"                     temperature; kept only if better.          (0 = off)\n"
+"  --elim-mode M      0 = the re-anneal alone; 1 = one route, Nagata & Braysy\n"
+"                     rule (feasible insertion first, ejections by penalty);\n"
+"                     2 = one route, choices by estimated cost; 3 = Nagata &\n"
+"                     Braysy in full (squeeze, perturbation), up to --elim-max\n"
+"                     routes one after the other              (default 3)\n"
+"  --elim-max K       M = 3: routes removed at most               (default 5)\n"
+"  --elim-perturb I   M = 3: random feasible moves after each insertion (100)\n"
+"  --elim-tp X        M = 3: their temperature, x the final one; 0 = any\n"
+"                     feasible move is accepted                  (default 0)\n"
+"  --elim-ej E        M = 3: ejection rule of mode 1 or 2         (default 1)\n"
+"  --elim-levels L    M = 3: 1 = re-anneal every level, budget shared;\n"
+"                     0 = the last level only                    (default 1)\n"
+"  --elim-sigma S     M = 2: weight of the penalties, x the mean distance to\n"
+"                     the nearest neighbour                      (default 5)\n"
+"  --elim-thi X       re-anneal from X x the final temperature  (default 3)\n"
+"  --elim-thi2 X      ... or from X x it after an elimination   (default 10)\n"
+"  --elim-iter I      at most I x n insertions per route         (default 5)\n"
+"  --elim-kmax K      at most K customers ejected at once        (default 3)\n"
 "  --race-at F        fraction of the budget at which the checkpoint sits\n"
 "                     (default 0.25)\n"
 "  --pair P           interleave two starts in the same loop to overlap memory\n"
@@ -3291,6 +4320,20 @@ static void usage(void)
 "                     back. The only global operator besides Split.\n"
 "                                                     (default 50; 0 = off)\n"
 "  --kick-max K       customers removed per kick, drawn in [1, K] (default 20)\n"
+"  --kick-repair M    kick reinsertion: 0 = cheapest feasible position\n"
+"                     (default); 1 = cheapest position regardless of capacity,\n"
+"                     then each overloaded route sheds the customer whose move\n"
+"                     elsewhere costs least, until feasible; 2 = same, among\n"
+"                     the worst placed customers only (see --repair-top/-k)\n"
+"  --repair-top T     M = 2: the customers of the route are taken by\n"
+"                     decreasing detour until T have a feasible move (4)\n"
+"  --repair-k K       M = 2: moves tried next to the K nearest neighbours (10)\n"
+"  --kick-early       kick: Metropolis threshold drawn first, the kick is\n"
+"                     abandoned as soon as it is lost; same acceptance law,\n"
+"                     another random stream (default on)\n"
+"  --no-kick-early    threshold drawn after the recreate (runs before 2026-10-20)\n"
+"  --op-cycle         operators in a fixed cycle respecting the --ops weights\n"
+"                     instead of one random draw per step (faster)\n"
 "  --dlb T            don't-look bits: skip a candidate pair when both ends\n"
 "                     have been rejected T times in a row without moving.\n"
 "                     The counters are cleared at every decade of T.\n"
@@ -3348,7 +4391,11 @@ int main(int argc, char **argv)
      *     --pick 2 --pick2 2 --restarts 1 --kick 100 --kick-max 10
      * restores the previous defaults bit for bit (bench/run_savant.py STOCK). */
     o.sa_steps = 1000; o.sa_t0 = -1.0; o.sa_tend = -1.0; o.sa_chi0 = 0.001;
-    o.sa_decades = 1.0; o.split = 0; o.split_every = 0; o.split_tour = 2;
+    o.sa_decades = 1.0;
+    o.kick_repair = 0; o.repair_top = 4; o.repair_k = 10;
+    o.elim_frac = 0.0; o.elim_mode = 3; o.elim_sigma = 5.0; o.elim_thi = 3.0;
+    o.elim_thi2 = 10.0; o.elim_iter = 5.0; o.elim_kmax = 3; o.elim_max = 5;
+    o.elim_perturb = 100; o.elim_tp = 0.0; o.elim_ej = 1; o.elim_levels = 1; o.split = 0; o.split_every = 0; o.split_tour = 2;
     o.restarts = 4; o.cw_rand = 1; o.cw_alpha = 0.03; o.pick_t = 1; o.pick_eps = 0.3; o.pick_crit = 0; o.sa_knn = 20;
     o.w_rel = 1.0; o.w_swap = 1.0; o.w_2opt = 1.0; o.w_or = 0.0; o.or_max = 3;
     o.w_sstar = 1.0; o.w_open = 0.05;
@@ -3358,6 +4405,7 @@ int main(int argc, char **argv)
     o.sa_auto = 0; o.sa_auto_a = 668.0; o.sa_auto_g = 1.37;
     o.sa_auto_min = 500000.0;
     o.kick_every = 50; o.kick_max = 20; o.dlb = 0;
+    o.kick_early = 1;                 /* default since 2026-10-20: same law, ~4 % more steps */
     o.t0_trim = 0.0; o.two_opt_knn = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -3431,6 +4479,9 @@ int main(int argc, char **argv)
             else die("--split-tour: routes | sweep | both");
         }
         else if (!strcmp(a, "--restarts"))     o.restarts = (int)opt_int(a, NEXT());
+        else if (!strcmp(a, "--op-cycle"))     o.op_cycle = 1;
+        else if (!strcmp(a, "--kick-early"))   o.kick_early = 1;
+        else if (!strcmp(a, "--no-kick-early")) o.kick_early = 0;
         else if (!strcmp(a, "--pick"))         o.pick_t = (int)opt_int(a, NEXT());
         else if (!strcmp(a, "--pick2"))        o.pick2 = (int)opt_int(a, NEXT());
         else if (!strcmp(a, "--vrank"))        o.vrank = (int)opt_int(a, NEXT());
@@ -3446,6 +4497,22 @@ int main(int argc, char **argv)
             o.race = strcmp(v, "off") ? opt_num(a, v) : 0.0;
         }
         else if (!strcmp(a, "--race-at"))      o.race_at = opt_num(a, NEXT());
+        else if (!strcmp(a, "--pursue"))       o.pursue = opt_num(a, NEXT());
+        else if (!strcmp(a, "--kick-repair"))  o.kick_repair = (int)opt_int(a, NEXT());
+        else if (!strcmp(a, "--repair-top"))   o.repair_top = (int)opt_int(a, NEXT());
+        else if (!strcmp(a, "--repair-k"))     o.repair_k = (int)opt_int(a, NEXT());
+        else if (!strcmp(a, "--elim"))         o.elim_frac = opt_num(a, NEXT());
+        else if (!strcmp(a, "--elim-mode"))    o.elim_mode = (int)opt_int(a, NEXT());
+        else if (!strcmp(a, "--elim-sigma"))   o.elim_sigma = opt_num(a, NEXT());
+        else if (!strcmp(a, "--elim-thi"))     o.elim_thi = opt_num(a, NEXT());
+        else if (!strcmp(a, "--elim-thi2"))    o.elim_thi2 = opt_num(a, NEXT());
+        else if (!strcmp(a, "--elim-iter"))    o.elim_iter = opt_num(a, NEXT());
+        else if (!strcmp(a, "--elim-kmax"))    o.elim_kmax = (int)opt_int(a, NEXT());
+        else if (!strcmp(a, "--elim-max"))     o.elim_max = (int)opt_int(a, NEXT());
+        else if (!strcmp(a, "--elim-perturb")) o.elim_perturb = (int)opt_int(a, NEXT());
+        else if (!strcmp(a, "--elim-tp"))      o.elim_tp = opt_num(a, NEXT());
+        else if (!strcmp(a, "--elim-ej"))      o.elim_ej = (int)opt_int(a, NEXT());
+        else if (!strcmp(a, "--elim-levels"))  o.elim_levels = (int)opt_int(a, NEXT());
         else if (!strcmp(a, "--or-max"))       o.or_max = (int)opt_int(a, NEXT());
         else if (!strcmp(a, "--pick-eps"))     o.pick_eps = opt_num(a, NEXT());
         else if (!strcmp(a, "--pick-crit")) {
@@ -3517,6 +4584,20 @@ int main(int argc, char **argv)
                         + o.w_sstar + o.w_open <= 0)
         die("--ops: at least one weight must be strictly positive");
     if (o.restart_par < 1) die("--restart-par: at least 1 (1 = sequential)");
+    if (o.pursue < 0.0 || o.pursue >= 1.0) die("--pursue: 0 <= F < 1");
+    if (o.pursue > 0.0 && (o.race > 0.0 || o.restart_par > 1))
+        die("--pursue: not with --race or --restart-par");
+    if (o.elim_frac < 0.0 || o.elim_frac >= 1.0) die("--elim: 0 <= F < 1");
+    if (o.elim_frac > 0.0 && (o.pursue > 0.0 || o.race > 0.0 || o.restart_par > 1))
+        die("--elim: not with --pursue, --race or --restart-par");
+    if (o.elim_mode < 0 || o.elim_mode > 3) die("--elim-mode: 0 to 3");
+    if (o.elim_max < 1) die("--elim-max: at least 1");
+    if (o.elim_ej < 1 || o.elim_ej > 2) die("--elim-ej: 1 or 2");
+    if (o.elim_levels < 0 || o.elim_levels > 1) die("--elim-levels: 0 or 1");
+    if (o.elim_perturb < 0) die("--elim-perturb: non-negative");
+    if (o.elim_kmax < 1 || o.elim_kmax > 3) die("--elim-kmax: 1, 2 or 3");
+    if (o.elim_thi < 1.0 || o.elim_thi2 < 1.0) die("--elim-thi/-thi2: at least 1");
+    if (o.elim_iter <= 0.0) die("--elim-iter: positive");
     if (o.restart_par > 1 && o.race > 0.0)
         die("--restart-par with --race: racing redistributes the budget "
             "between restarts, which parallel restarts cannot see. Pick one.");
@@ -3541,6 +4622,9 @@ int main(int argc, char **argv)
     if (o.empty_p < 0.0 || o.empty_p > 1.0) die("--empty-p: 0 <= P <= 1");
     if (o.kick_every < 0) die("--kick: period in steps, 0 = off");
     if (o.kick_max < 1 || o.kick_max > 64) die("--kick-max: between 1 and 64");
+    if (o.kick_repair < 0 || o.kick_repair > 2) die("--kick-repair: 0, 1 or 2");
+    if (o.repair_top < 1) die("--repair-top: at least 1");
+    if (o.repair_k < 1) die("--repair-k: at least 1");
     if (o.dlb < 0) die("--dlb: rejections before a vertex goes quiet, 0 = off");
     if (o.t0_trim < 0.0 || o.t0_trim >= 1.0) die("--t0-trim: 0 <= F < 1");
 
@@ -3675,6 +4759,9 @@ int main(int argc, char **argv)
         if (o.kick_every > 0)
             printf("# kick       : ruin & recreate every %d steps, up to %d "
                    "customers\n", o.kick_every, o.kick_max);
+        if (o.elim_frac > 0.0)
+            printf("# elimination: mode %d, then a re-anneal on %g of the budget, "
+                   "at low temperature\n", o.elim_mode, o.elim_frac);
         if (o.dlb > 0)
             printf("# don't-look : skip a pair after %d rejections, cleared "
                    "every decade of T\n", o.dlb);

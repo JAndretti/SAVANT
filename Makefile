@@ -48,7 +48,12 @@ serial: $(SRC)
 debug: $(SRC)
 	$(CC) -O0 -g -fsanitize=address,undefined -std=gnu11 -Wall -Wextra -o cw_dbg $< $(LDFLAGS)
 
-clean:
-	rm -f cw cw_repro cw_dbg
+# invariant checks after every step that changed the solution (see
+# check_invariants in cw.c); slow, for tests only -- run with --threads 1
+check: $(SRC)
+	$(CC) $(CFLAGS) -ffp-contract=off -DCW_CHECK $(OMP) -o cw_check $< $(LDFLAGS)
 
-.PHONY: all auto repro macos serial debug clean
+clean:
+	rm -f cw cw_repro cw_dbg cw_check
+
+.PHONY: all auto repro macos serial debug check clean

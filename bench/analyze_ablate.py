@@ -7,9 +7,15 @@ that much. Holm correction within a budget.
 
     uv run python -m bench.analyze_ablate
 writes results/phase2/ablate_summary.csv
+    uv run python -m bench.analyze_ablate --dir results/p1_sorted_knn
+analyses the ablate_f*.csv of that directory instead and writes its summary
+there; the reference costs still include every run of results/phase2.
 """
 
 from __future__ import annotations
+
+import argparse
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -30,12 +36,16 @@ def holm(p: np.ndarray) -> np.ndarray:
 
 
 def main() -> None:
-    files = [f for f in sorted(OUT.glob("ablate_f*.csv")) if "summary" not in f.name]
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--dir", type=Path, default=OUT, help="directory of the ablate_f*.csv files")
+    src = ROOT / ap.parse_args().dir
+    files = [f for f in sorted(src.glob("ablate_f*.csv")) if "summary" not in f.name]
     if not files:
         raise SystemExit("no ablation results yet")
     df = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
     others = sorted(OUT.glob("screen_B*.csv")) + sorted(OUT.glob("timematch_f*.csv")) \
-        + [f for f in OUT.glob("interact_*.csv") if "summary" not in f.name]
+        + [f for f in OUT.glob("interact_*.csv") if "summary" not in f.name] \
+        + ([f for f in OUT.glob("ablate_f*.csv") if "summary" not in f.name] if src != OUT else [])
     allr = pd.concat([df] + [pd.read_csv(f) for f in others], ignore_index=True)
     if (df.feasible != 1).any():
         print(f"WARNING: {int((df.feasible != 1).sum())} infeasible runs excluded")
@@ -71,8 +81,8 @@ def main() -> None:
               .to_string(index=False, float_format=lambda v: f"{v:.4f}"))
         rows.append(part)
 
-    pd.concat(rows, ignore_index=True).to_csv(OUT / "ablate_summary.csv", index=False)
-    print(f"\nwrote {OUT / 'ablate_summary.csv'}")
+    pd.concat(rows, ignore_index=True).to_csv(src / "ablate_summary.csv", index=False)
+    print(f"\nwrote {src / 'ablate_summary.csv'}")
 
 
 if __name__ == "__main__":

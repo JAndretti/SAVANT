@@ -60,6 +60,17 @@ def convergence(cp: pd.DataFrame, out: Path, width: float) -> None:
         ax.plot(row.index * 100, row.to_numpy(), label=LABEL.get(solver, solver), **style(solver))
     ax.set_xscale("log")
     ax.set_yscale("log")
+    # shade the checkpoints at which SAVANT holds the best solution of all solvers
+    if "savant" in gaps.index and len(gaps) > 1:
+        others = gaps.drop(index="savant").min(axis=0, skipna=True)
+        lead = [x for x in gaps.columns if gaps.loc["savant", x] < others[x]]
+        if lead:
+            ax.axvspan(min(lead) * 100, max(lead) * 100, color="0.85", lw=0, zorder=0)
+            ax.text((min(lead) * max(lead)) ** 0.5 * 100, 0.97, "SAVANT best",
+                    transform=ax.get_xaxis_transform(), ha="center", va="top", fontsize=6.5)
+    # with R = 4 restarts sharing the time, SAVANT's first chain ends at T_max / 4
+    # (explained in the caption: a label here sits on top of the curves)
+    ax.axvline(25, color="0.4", lw=0.6, ls=(0, (1, 1.5)), zorder=1)
     ax.set_xlabel(r"fraction of $T_{\max}$ (\%)" if plt.rcParams["text.usetex"]
                   else "fraction of $T_{max}$ (%)")
     ax.set_ylabel("mean gap to reference (%)")

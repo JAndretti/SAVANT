@@ -94,6 +94,37 @@ CONFIGS: dict[str, str] = {
     "restarts_4_race": "--restarts 4 --race 0.002",
 }
 
+# Re-run on 2026-10-19 after the kNN lists were sorted (they were in heap order,
+# farthest first, so --vrank had favoured the farthest neighbours). Run with the
+# sorted cw_repro, together with `default`, into results/p1_sorted_knn/:
+#   uv run python -m bench.sweep --budget 1e4 --configs default,vrank_2_knn30,saknn_30,vrank_2 \
+#       --out results/p1_sorted_knn/screen_B10000.csv          (same for 1e5, 1e6)
+# bench.analyze_sweep substitutes these rows for the old ones.
+SORTED_KNN = {
+    "vrank_2_knn30": CONFIGS["vrank_2_knn30"],
+    "saknn_30": "--sa-knn 30",                   # control: the larger lists alone
+    "vrank_2": "--vrank 2",                      # control: the rank bias alone, K = 20
+}
+
+# P3 (2026-10-20): number of starts R and schedule width D, around the FINAL
+# configuration (cw defaults: R = 4, D = 1); run with --base final, so STOCK is
+# not prepended. Budget is total steps per customer, as above (R starts of B/R;
+# with --pursue F the starts get (1-F)B/R each and the pursuit F*B). Restarts and
+# D do not change the cost of a step, so step-matched is time-matched here.
+#   uv run python -m bench.sweep --base final --budget 1e6 --configs p3 \
+#       --out results/p3_starts/screen_B1e+06.csv            (same for 1e5, 4e6)
+P3_STARTS = {
+    "final": "",
+    "r1": "--restarts 1",
+    "r2": "--restarts 2",
+    "r8": "--restarts 8",
+    "r2_pursue": "--restarts 2 --pursue 0.5",
+    "r4_pursue": "--restarts 4 --pursue 0.5",
+    "decades_0.75": "--t-decades 0.75",
+    "decades_1.25": "--t-decades 1.25",
+    "decades_1.5": "--t-decades 1.5",    # follow-up, 4e6 only
+}
+
 # (tuning subset, stride): ~180 instances, n = 100..2000
 SCREEN = [("xml100", 6), ("gen100", 2), ("gen200", 2), ("gen500", 2), ("gen1000", 2),
           ("gen2000", 2), ("xlike", 1)]
@@ -118,18 +149,22 @@ def main() -> None:
     ap.add_argument("--binary", default=str(ROOT / "cw_repro"))
     ap.add_argument("--jobs", type=int, default=0)
     ap.add_argument("--list", action="store_true")
+    ap.add_argument("--base", choices=["stock", "final"], default="stock",
+                    help="stock: prepend STOCK (Phase 2 runs); final: cw defaults (P3)")
     a = ap.parse_args()
     if a.list:
-        for k, v in CONFIGS.items():
+        for k, v in {**CONFIGS, **SORTED_KNN, **P3_STARTS}.items():
             print(f"{k:22s} {v}")
         return
     if a.budget is None:
         ap.error("--budget is required")
-    names = list(CONFIGS) if a.configs == "all" else a.configs.split(",")
+    table = P3_STARTS if a.base == "final" else {**CONFIGS, **SORTED_KNN}
+    names = (list(CONFIGS) if a.configs == "all" else list(P3_STARTS) if a.configs == "p3"
+             else a.configs.split(","))
     out = ROOT / (a.out or f"results/phase2/screen_B{a.budget:g}.csv")
     for name in names:
-        extra = CONFIGS[name]
-        options = f"{STOCK} {extra}"                 # cw: the last occurrence wins
+        extra = table[name]
+        options = extra if a.base == "final" else f"{STOCK} {extra}"  # cw: last one wins
         tasks = screen_tasks(a.budget, restarts_of(options), a.seeds)
         execute(tasks, savant_runner(a.binary, shlex.split(options)), solver="savant",
                 tag=name, extra=extra, out=out, jobs=a.jobs)

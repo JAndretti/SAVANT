@@ -26,12 +26,83 @@ GROUPS = {
     "Operators": ["ops_relocate_only", "ops_no_swap", "ops_no_2opt", "ops_no_swapstar",
                   "ops_swapstar_x2", "ops_oropt", "ops_oropt_max5", "ops_no_open", "ops_open_0.2",
                   "empty_p_0.05"],
-    "Move selection": ["pick_uniform", "pick_uniform_both", "pick_3", "pick_4", "pick_fenwick", "crit_rem", "crit_remnorm",
-                       "crit_raw", "pick2_1", "pick2_3", "vrank_2_knn30", "saknn_10", "saknn_40",
-                       "saknn_uniform", "reloc_long", "dlb_5"],
+    "Candidate lists": ["saknn_uniform", "saknn_10", "saknn_40", "saknn_30", "vrank_2", "vrank_2_knn30"],
+    "Move selection": ["pick_uniform", "pick2_1", "pick_uniform_both", "pick_3", "pick_4", "pick2_3",
+                       "pick_fenwick", "crit_rem", "crit_remnorm", "crit_raw", "reloc_long", "dlb_5"],
     "Ruin \\& recreate": ["kick_off", "kick_50", "kick_500", "kickmax_5", "kickmax_20"],
     "Split": ["split_end", "split_both", "split_every"],
-    "Restarts ($R=4$)": ["restarts_4", "restarts_4_param", "restarts_4_race"],
+    "Restarts": ["restarts_4", "restarts_4_param", "restarts_4_race"],
+}
+
+# what the reference ("stock") configuration does for each component, printed
+# under the component's name so that every row reads as a change from it
+GROUP_LEGEND = {
+    "Construction": r"stock: parallel savings, $\lambda=1$, $\mu=0$ (Eq.~\ref{eq:saving})",
+    "Temperature": r"stock: $\chi_0=10^{-3}$, $D=1$ decade, $T_0$ from the plain mean of $\Delta^+$",
+    "Operators": r"weights $w$ of relocate, swap, 2-opt, or-opt, \swapstar, open; "
+                 r"stock: $(1,1,1,0,1,0.05)$",
+    "Candidate lists": r"$v$ drawn among the $K$ nearest customers of $u$; stock: $K=20$, "
+                       r"uniform rank",
+    "Move selection": r"tournament sizes $T_u,T_v$ on the regret $r$ (Eq.~\ref{eq:regret}); "
+                      r"stock: $T_u=T_v=2$",
+    "Ruin \\& recreate": r"one move every $P$ steps, removing up to $k_{\max}$ customers; "
+                         r"stock: $P=100$, $k_{\max}=10$",
+    "Split": r"stock: no Split",
+    "Restarts": r"$R$ chains sharing the budget; stock: $R=1$",
+}
+
+SCREEN_TEX = {
+    "init_random": r"random initial solution",
+    "lambda_0.6": r"$\lambda=0.6$",
+    "lambda_1.4": r"$\lambda=1.4$",
+    "mu_0.3": r"$\mu=0.3$",
+    "cw_2opt": r"2-opt on each savings route",
+    "taccept_1e-4": r"$\chi_0=10^{-4}$",
+    "taccept_1e-2": r"$\chi_0=10^{-2}$",
+    "taccept_1e-1": r"$\chi_0=10^{-1}$",
+    "decades_0.5": r"$D=0.5$",
+    "decades_2": r"$D=2$",
+    "decades_3": r"$D=3$",
+    "t0trim_0.1": r"$T_0$ from a $10\%$-trimmed mean",
+    "ops_relocate_only": r"relocate only, $w=(1,0,0,0,0,0)$",
+    "ops_no_swap": r"no swap",
+    "ops_no_2opt": r"no 2-opt",
+    "ops_no_swapstar": r"no \swapstar",
+    "ops_swapstar_x2": r"\swapstar weight $2$",
+    "ops_oropt": r"with or-opt, $L_{\max}=3$",
+    "ops_oropt_max5": r"with or-opt, $L_{\max}=5$",
+    "ops_no_open": r"no open",
+    "ops_open_0.2": r"open weight $0.2$",
+    "empty_p_0.05": r"relocate into an empty route w.p.\ $0.05$",
+    "saknn_uniform": r"no candidate lists ($v$ uniform in $V$)",
+    "saknn_10": r"$K=10$",
+    "saknn_40": r"$K=40$",
+    "saknn_30": r"$K=30^\ddagger$",
+    "vrank_2": r"bias towards nearer ranks ($K=20$)$^\ddagger$",
+    "vrank_2_knn30": r"$K=30$, bias towards nearer ranks$^\ddagger$",
+    "pick_uniform": r"$T_u=1$ (first vertex uniform)",
+    "pick2_1": r"$T_v=1$ (second vertex uniform)",
+    "pick_uniform_both": r"$T_u=T_v=1$ (both uniform)",
+    "pick_3": r"$T_u=3$",
+    "pick_4": r"$T_u=4$",
+    "pick2_3": r"$T_v=3$",
+    "pick_fenwick": r"$u$ drawn $\propto r(u)$ (Fenwick tree)",
+    "crit_rem": r"regret $=$ removal gain",
+    "crit_remnorm": r"regret $=$ removal gain$/\ell(u)$",
+    "crit_raw": r"regret $=c_{pu}+c_{us}$",
+    "reloc_long": r"relocate breaks the longer edge at $v$",
+    "dlb_5": r"don't-look bits (threshold $5$)",
+    "kick_off": r"no ruin-and-recreate",
+    "kick_50": r"$P=50$",
+    "kick_500": r"$P=500$",
+    "kickmax_5": r"$k_{\max}=5$",
+    "kickmax_20": r"$k_{\max}=20$",
+    "split_end": r"Split the final solution",
+    "split_both": r"Split after construction and at the end",
+    "split_every": r"Split every $10^5$ steps and at the end",
+    "restarts_4": r"$R=4$",
+    "restarts_4_param": r"$R=4$, random $(\lambda,\mu)$ per restart",
+    "restarts_4_race": r"$R=4$ with racing",
 }
 
 
@@ -57,28 +128,45 @@ def screening() -> None:
     missing = set(CONFIGS) - {"default"} - {c for g in GROUPS.values() for c in g}
     assert not missing, f"configurations without a group: {missing}"
 
+    missing = {c for g in GROUPS.values() for c in g} - set(SCREEN_TEX)
+    assert not missing, f"configurations without a label: {missing}"
+
     base = {b: idx.get((b, "default")) for b in BUDGETS}
+    # the rows marked \ddagger were re-run once the kNN lists were sorted
+    chk = pd.read_csv(ROOT / "results" / "p1_sorted_knn" / "sort_check.csv").set_index("budget")
+    sort_d = ", ".join(f"${0.0 if abs(chk.delta[b]) < 0.005 else chk.delta[b]:+.2f}$" for b in BUDGETS)
+    sort_p = min(chk.p)
     lines = [
         r"\begin{table*}[t]",
-        r"\caption{One-factor-at-a-time screening. Mean paired difference of the gap (percentage points) "
-        r"with respect to the default configuration, for $B\cdot n$ annealing steps; negative is better. "
-        r"$^\dagger$: Holm-corrected Wilcoxon $p<0.05$ ($181$ instances $\times$ $3$ seeds). "
-        r"Time: mean run time relative to the default at the largest budget available.}\label{tab:screening}",
-        r"\begin{tabular*}{\tblwidth}{@{\extracolsep{\fill}}llrrrr@{}}",
+        r"\caption{One-factor-at-a-time screening at a fixed number of annealing steps. Each row "
+        r"changes one parameter of the stock configuration (Table~\ref{tab:params}), whose value "
+        r"is given in italics after the name of each component. Columns $10^4$, $10^5$, $10^6$: "
+        r"runs of $B\cdot n$ steps. Cells: mean paired difference of the gap with the stock "
+        r"configuration, in percentage points, over $181$ tuning instances $\times$ $3$ seeds; "
+        r"negative is better, bold marks a significant improvement, $^\dagger$: Holm-corrected "
+        r"Wilcoxon $p<0.05$. Time: run time relative to the stock configuration at the largest "
+        r"budget, i.e.\ the relative cost of a step. "
+        r"$^\ddagger$: candidate lists sorted by distance, against the stock configuration "
+        r"run likewise; sorting alone changes its gap by "
+        + sort_d + rf" ($p\geq{sort_p:.2f}$)."
+        r"}\label{tab:screening}",
+        r"\footnotesize\renewcommand{\arraystretch}{0.88}",   # 50 variants and 8 component headers: one page at normal size is too short
+        r"\begin{tabular*}{\tblwidth}{@{\extracolsep{\fill}}lrrrr@{}}",
         r"\toprule",
-        "Component & Variant (options) & " + " & ".join(BUDGET_TEX[b] for b in BUDGETS) + r" & Time \\",
+        "Variant & " + " & ".join(BUDGET_TEX[b] for b in BUDGETS) + r" & Time \\",
         r"\midrule",
-        "& default gap (\\%) & " + " & ".join(f"{base[b].gap:.2f}" if base[b] is not None else "--"
-                                              for b in BUDGETS) + r" & 1.00 \\",
+        r"stock configuration: gap (\%) & "
+        + " & ".join(f"{base[b].gap:.2f}" if base[b] is not None else "--" for b in BUDGETS)
+        + r" & 1.00 \\",
     ]
     for group, names in GROUPS.items():
-        lines.append(r"\midrule")
-        for k, name in enumerate(names):
+        lines += [r"\midrule",
+                  rf"\multicolumn{{5}}{{@{{}}l}}{{\textbf{{{group}}} --- \emph{{{GROUP_LEGEND[group]}}}}} \\"]
+        for name in names:
             rows = [idx.get((b, name)) for b in BUDGETS]
             last = next((r for r in reversed(rows) if r is not None), None)
-            opts = tex_escape(CONFIGS[name]).replace("--", "-{}-")
             time_x = f"{last.time_x:.2f}" if last is not None else "--"
-            lines.append(f"{group if k == 0 else ''} & \\texttt{{{opts}}} & "
+            lines.append(rf"\quad {SCREEN_TEX[name]} & "
                          + " & ".join(cell(r) for r in rows) + f" & {time_x} \\\\")
     lines += [r"\bottomrule", r"\end{tabular*}", r"\end{table*}"]
     TABLES.mkdir(parents=True, exist_ok=True)
@@ -97,20 +185,25 @@ def timematch() -> None:
     order = sorted(s.t.unique())
     lines = [
         r"\begin{table}[t]",
-        r"\caption{Time-matched selection experiment. Each configuration receives the same wall-clock "
-        r"budget $T=f\cdot n\cdot 2.4$~s; the tournament is disabled on one or both stages. "
-        r"$\Delta$: mean paired difference of the gap (percentage points, negative = better than the "
-        r"regret tournament); steps: annealing steps run relative to it. "
+        r"\caption{Regret tournament against uniform selection at equal running time. Rows are "
+        r"grouped by budget $T=f\cdot T_{\max}$, from the shortest to the longest; the header "
+        r"of each group gives $T$ averaged over the instances and the gap of the regret "
+        r"tournament ($T_u=T_v=2$), the reference of the group. Each row replaces the "
+        r"tournament by uniform sampling on the first stage, the second, or both. "
+        r"$\Delta$: mean paired difference of the gap (percentage points); negative means "
+        r"uniform selection is better. Steps: annealing steps performed in the same time, "
+        r"relative to the tournament. Pairs: (instance, seed) pairs compared. "
         r"$^\dagger$: two-sided Wilcoxon $p<0.05$.}\label{tab:timematch}",
         r"\begin{tabular*}{\tblwidth}{@{\extracolsep{\fill}}lrrrr@{}}",
         r"\toprule",
-        r"$T$ (s) & Variant & $\Delta$ & steps & pairs \\",
+        r" & Variant & $\Delta$ & Steps & Pairs \\",
         r"\midrule",
     ]
     for t in order:
         part = s[s.t == t]
         base = part.base_gap.iloc[0]
-        lines.append(rf"\multicolumn{{5}}{{@{{}}l}}{{$T\approx{t:g}$~s, regret tournament: "
+        f = part.budget.iloc[0].split("=")[1].split("*")[0]
+        lines.append(rf"\multicolumn{{5}}{{@{{}}l}}{{$f={f}$ ($T\approx{t:g}$~s), regret tournament: "
                      rf"gap ${base:.3f}\%$}} \\")
         for r in part.itertuples():
             # the dagger stays inside the cell's own math mode: no nested $...$
@@ -123,8 +216,11 @@ def timematch() -> None:
     print(f"wrote {TABLES / 'timematch.tex'}")
 
 
-FACTOR_TEX = {"restarts": r"$R=4$ restarts", "kick": r"kick period $50$",
-              "knn": r"candidate lists $K=40$", "kickmax": r"kick size $k_{\max}=20$"}
+FACTOR_TEX = {"restarts": r"restarts: $R=4$ (vs.\ $1$)",
+              "kick": r"kick period: $P=50$ (vs.\ $100$)",
+              "knn": r"candidate lists: $K=40$ (vs.\ $20$)",
+              "kickmax": r"kick size: $k_{\max}=20$ (vs.\ $10$)"}
+FACTOR_SYM = {"restarts": "$R$", "kick": "$P$", "knn": "$K$", "kickmax": r"$k_{\max}$"}
 
 
 def interactions() -> None:
@@ -151,12 +247,15 @@ def interactions() -> None:
 
     lines = [
         r"\begin{table}[t]",
-        r"\caption{Factorial study of the retained factors at equal running time "
-        r"($T=f\cdot n\cdot 2.4$~s). Main effect: mean paired difference of the gap "
-        r"(percentage points) between the cells where the factor is on and the matching "
-        r"cells where it is off; negative is better. An interaction is the change of one "
-        r"main effect when the other factor is on; values close to zero mean the factors "
-        r"are additive. $^\dagger$: Wilcoxon $p<0.05$.}\label{tab:interactions}",
+        r"\caption{Full factorial study of the factors retained by the screening, at equal "
+        r"running time $T=f\cdot T_{\max}$. Each factor has two levels, its stock value (off) "
+        r"and the value suggested by the screening (on), and every combination of levels is "
+        r"run. Main effect: mean paired difference of the gap (percentage points) between the "
+        r"runs where the factor is on and the matching runs where it is off; negative is "
+        r"better. Interaction $A\times B$: how much the main effect of $A$ changes when $B$ is "
+        r"on; a value close to zero means that the two factors add up, a negative value that "
+        r"they reinforce each other. The candidate-list size was dropped at $f=0.1$ "
+        r"(\enspace--\enspace). $^\dagger$: Wilcoxon $p<0.05$.}\label{tab:interactions}",
         r"\begin{tabular*}{\tblwidth}{@{\extracolsep{\fill}}l" + "r" * len(budgets) + r"@{}}",
         r"\toprule",
         f"Factor & {head} \\\\",
@@ -168,7 +267,7 @@ def interactions() -> None:
     lines.append(r"\multicolumn{" + str(len(budgets) + 1) + r"}{@{}l}{\emph{Interactions}} \\")
     for name in sorted(s[s.view == "interaction"].name.unique()):
         a, b = name.split("x", 1)
-        lines.append(row("interaction", name, f"{a} $\\times$ {b}"))
+        lines.append(row("interaction", name, f"{FACTOR_SYM[a]} $\\times$ {FACTOR_SYM[b]}"))
     lines += [r"\bottomrule", r"\end{tabular*}", r"\end{table}"]
     TABLES.mkdir(parents=True, exist_ok=True)
     (TABLES / "interactions.tex").write_text("\n".join(lines) + "\n")
@@ -176,11 +275,11 @@ def interactions() -> None:
 
 
 ABLATE_TEX = {  # in table order
-    "stock": r"stock configuration (Table~\ref{tab:screening})",
-    "tournament": r"regret tournament instead of uniform selection",
+    "stock": r"stock configuration",
+    "tournament": r"regret tournament ($T_u=T_v=2$)",
     "no_restarts": r"single start ($R=1$)",
-    "kick_period_100": r"ruin-and-recreate every $100$ steps",
-    "kick_max_10": r"kick size $k_{\max}=10$",
+    "kick_period_100": r"ruin \& recreate period $P=100$",
+    "kick_max_10": r"ruin \& recreate size $k_{\max}=10$",
     "no_kick": r"no ruin-and-recreate",
     "no_swapstar": r"no \swapstar",
     "no_2opt": r"no 2-opt",
@@ -196,36 +295,46 @@ def ablation() -> None:
         print(f"skipped ablation: {path} not written yet")
         return
     s = pd.read_csv(path)
-    budgets = sorted(s.budget.unique(), key=lambda b: float(b.split("=")[1].split("*")[0]))
-    head = " & ".join(rf"$f={b.split('=')[1].split('*')[0]}$" for b in budgets)
-    base = s[s.tag == "final"]
-    gaps = ", ".join(rf"${base[base.budget == b].base_gap.iloc[0]:.3f}\%$ at $f={b.split('=')[1].split('*')[0]}$"
-                     for b in budgets if not base[base.budget == b].empty)
+    s["f"] = s.budget.map(lambda b: float(b.split("=")[1].split("*")[0]))
+    s = s[s.tag != "final"]
+    budgets = sorted(s.f.unique())
+    full, longer = budgets[0], budgets[1:]
+
+    def row(r) -> str:
+        d = f"${r.delta:+.3f}" + (r"^\dagger$" if r.p_holm < 0.05 else "$")
+        decided = r.wins + r.losses        # pairs that are not tied
+        return (f"{ABLATE_TEX[r.tag]} & {d} & "
+                f"{100 * r.losses / decided:.0f} / {100 * r.wins / decided:.0f} \\\\")
+
+    def ordered(part: pd.DataFrame) -> list:
+        return sorted(part.itertuples(), key=lambda r: list(ABLATE_TEX).index(r.tag))
 
     lines = [
-        # full width: the row labels are sentences, and at \columnwidth (238 pt)
-        # the alignment overfills by ~69 pt into the neighbouring column
-        r"\begin{table*}[t]",
-        r"\caption{Ablation of the retained configuration at equal running time "
-        r"($T=f\cdot n\cdot 2.4$~s). Each row changes one element of that configuration; "
-        rf"a positive value is a degradation, i.e. what the element is worth. Reference gap: {gaps}. "
-        r"$^\dagger$: Holm-corrected Wilcoxon $p<0.05$.}\label{tab:ablation}",
-        r"\begin{tabular*}{\tblwidth}{@{\extracolsep{\fill}}l" + "r" * len(budgets) + r"@{}}",
+        r"\begin{table}[t]",
+        r"\caption{Ablation of the retained configuration (uniform selection, $R=4$, $P=50$, "
+        r"$k_{\max}=20$) at equal running time $T=f\cdot T_{\max}$. Each row changes one element "
+        r"of it. $\Delta$: mean paired difference of the gap, in percentage points; positive means "
+        r"the change degrades the solution, i.e.\ the element is worth $\Delta$. $^\dagger$: "
+        r"Holm-corrected Wilcoxon $p<0.05$. Ret./chg.\ (\%): share of the non-tied (instance, seed) "
+        r"pairs on which the retained configuration / the changed one is better. "
+        r"(a)~Every element, at the budget at which the ablation was run. "
+        r"(b)~Elements re-tested at longer budgets, closer to that of the comparison ($f=1$): those "
+        r"whose effect may depend on the budget, and at $f=1$ the stock configuration of "
+        r"Table~\ref{tab:screening}. The elements that are clearly significant in (a) were not "
+        r"re-run, which is why (b) has fewer rows.}\label{tab:ablation}",
+        r"\begin{tabular*}{\tblwidth}{@{\extracolsep{\fill}}lrr@{}}",
         r"\toprule",
-        f"Change & {head} \\\\",
-        r"\midrule",
+        r"Change & $\Delta$ & Ret./chg.\ (\%) \\",
     ]
-    for tag, label in ABLATE_TEX.items():
-        cells = []
-        for b in budgets:
-            r = s[(s.budget == b) & (s.tag == tag)]
-            if r.empty:
-                cells.append("--")
-                continue
-            d = r.delta.iloc[0]
-            cells.append(f"${d:+.3f}" + (r"^\dagger$" if r.p_holm.iloc[0] < 0.05 else "$"))
-        lines.append(f"{label} & " + " & ".join(cells) + r" \\")
-    lines += [r"\bottomrule", r"\end{tabular*}", r"\end{table*}"]
+    for k, f in enumerate(budgets):
+        part = s[s.f == f]
+        n_pairs, ref = int(part.pairs.iloc[0]), part.base_gap.iloc[0]
+        tag = "(a)" if f == full else ("(b)" if f == longer[0] else "")
+        lines += [r"\midrule",
+                  rf"\multicolumn{{3}}{{@{{}}l}}{{\emph{{{(tag + ' ') if tag else ''}$f={f:g}$: reference gap "
+                  rf"${ref:.3f}\%$, ${n_pairs}$ pairs}}}} \\"]
+        lines += [row(r) for r in ordered(part)]
+    lines += [r"\bottomrule", r"\end{tabular*}", r"\end{table}"]
     TABLES.mkdir(parents=True, exist_ok=True)
     (TABLES / "ablation.tex").write_text("\n".join(lines) + "\n")
     print(f"wrote {TABLES / 'ablation.tex'}")
@@ -252,12 +361,13 @@ def comparison(set_dir: Path, name: str, caption_set: str) -> None:
         r"independent checker and excluded from the gaps. \emph{Time}: mean wall-clock time of the "
         r"whole process, over every run. "
         r"$\Delta$: mean paired difference against \savant\ on the instances both solve (positive "
-        r"= worse than \savant), with the Holm-corrected Wilcoxon $p$-value and the number of "
-        r"instances on which the solver beats / loses to \savant."
+        r"= worse than \savant), with the Holm-corrected Wilcoxon $p$-value. \emph{\savant\ better / "
+        r"worse}: percentage of these instances on which the mean gap of \savant\ is lower / higher "
+        r"than that of the solver; the two need not sum to $100$ when there are ties."
         rf"}}\label{{tab:cmp:{name}}}",
         r"\begin{tabular*}{\tblwidth}{@{\extracolsep{\fill}}lrrrrrrrr@{}}",
         r"\toprule",
-        r"Solver & Inst. & Mean & Best & Fail & Time (s) & $\Delta$ & W/L & $p$ \\",
+        r"Solver & Inst. & Mean & Best & Fail & Time (s) & $\Delta$ & \savant\ better / worse (\%) & $p$ \\",
         r"\midrule",
     ]
     for r in s.itertuples():
@@ -271,7 +381,7 @@ def comparison(set_dir: Path, name: str, caption_set: str) -> None:
         delta = f"${r.delta:+.3f}" + (r"^\dagger$" if p_holm < 0.05 else "$")
         lines.append(f"{label} & {int(r.instances)} & {r.gap_mean:.3f} & {r.gap_best:.3f} & "
                      f"{int(r.fails)} & {r.time_s:.0f} & {delta} & "
-                     f"{int(r.wins)}/{int(r.losses)} & {ptex} \\\\")
+                     f"{_wl(r)} & {ptex} \\\\")
     lines += [r"\bottomrule", r"\end{tabular*}", r"\end{table*}"]
     TABLES.mkdir(parents=True, exist_ok=True)
     (TABLES / f"comparison_{name}.tex").write_text("\n".join(lines) + "\n")
@@ -311,6 +421,12 @@ def checkpoints(set_dir: Path, name: str, caption_set: str) -> None:
     print(f"wrote {TABLES / f'checkpoints_{name}.tex'}")
 
 
+def _wl(r) -> str:
+    """Instances on which SAVANT is better / worse, in % of the instances both solve.
+    `wins` counts the instances on which the *other* solver is better."""
+    return f"{100 * r.losses / r.pairs:.0f} / {100 * r.wins / r.pairs:.0f}"
+
+
 def _ptex(p: float) -> str:
     return r"$<$0.001" if p < 0.001 else f"{p:.3f}"
 
@@ -324,13 +440,14 @@ def group_comparison(sets: list[tuple[Path, str]], name: str, caption: str) -> N
         r"($100$ per set); \emph{mean} averages the runs of an instance, \emph{best} takes the best "
         r"of them (\enspace--\enspace for NDS, run once per instance). \emph{Time}: mean wall-clock "
         r"time of the whole process. $\Delta$: mean paired difference against \savant\ (positive = "
-        r"worse than \savant), with the number of instances on which the solver beats / loses to "
-        r"\savant\ and the Holm-corrected Wilcoxon $p$-value; $^\dagger$: $p<0.05$. Every run of "
+        r"worse than \savant), with the Holm-corrected Wilcoxon $p$-value; $^\dagger$: $p<0.05$. "
+        r"\emph{\savant\ better / worse}: percentage of the instances on which the mean gap of "
+        r"\savant\ is lower / higher than that of the solver (the rest are ties). Every run of "
         r"every solver returned a feasible solution."
         rf"}}\label{{tab:cmp:{name}}}",
         r"\begin{tabular*}{\tblwidth}{@{\extracolsep{\fill}}lrrrrrr@{}}",
         r"\toprule",
-        r"Solver & Mean & Best & Time (s) & $\Delta$ & W/L & $p$ \\",
+        r"Solver & Mean & Best & Time (s) & $\Delta$ & \savant\ better / worse (\%) & $p$ \\",
     ]
     for set_dir, label in sets:
         s = pd.read_csv(set_dir / "summary.csv")
@@ -344,7 +461,7 @@ def group_comparison(sets: list[tuple[Path, str]], name: str, caption: str) -> N
                 lines.append(head + r" & -- & -- & -- \\")
                 continue
             delta = f"${r.delta:+.3f}" + (r"^\dagger$" if r.p_holm < 0.05 else "$")
-            lines.append(head + f" & {delta} & {int(r.wins)}/{int(r.losses)} & {_ptex(r.p_holm)} \\\\")
+            lines.append(head + f" & {delta} & {_wl(r)} & {_ptex(r.p_holm)} \\\\")
     lines += [r"\bottomrule", r"\end{tabular*}", r"\end{table*}"]
     TABLES.mkdir(parents=True, exist_ok=True)
     (TABLES / f"comparison_{name}.tex").write_text("\n".join(lines) + "\n")

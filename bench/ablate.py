@@ -45,6 +45,52 @@ CELLS: dict[str, str] = {
     "no_2opt": "--ops 1,1,0,0,1,0.05",
     "no_candidate_lists": "--sa-knn 0",
     "random_start": "--init random",
+    # additions, tested at equal time once the kNN lists were sorted (2026-10-19;
+    # the screening row "K = 30, bias towards nearer ranks" turned into a gain).
+    # Run with the sorted cw, `final` included, into results/p1_sorted_knn/:
+    #   uv run python -m bench.ablate --f 0.02 --every 2 --cells final,knn_30,knn_30_vrank_2 \
+    #       --out results/p1_sorted_knn/ablate_f0.02.csv        (and --f 0.1 --every 4)
+    #   uv run python -m bench.analyze_ablate --dir results/p1_sorted_knn
+    "knn_30": "--sa-knn 30",
+    "knn_30_vrank_2": "--sa-knn 30 --vrank 2",
+    # speedups of the supervisor (P2, 2026-10-20), tested at equal time with the
+    # cw that includes the bit-identical bnx + d0 speedups, `final` re-run:
+    #   uv run python -m bench.ablate --f 0.02 --every 2 \
+    #       --cells final,op_cycle,kick_early,op_cycle_kick_early \
+    #       --out results/p2_speedups/ablate_f0.02.csv        (and --f 0.1 --every 4)
+    #   uv run python -m bench.analyze_ablate --dir results/p2_speedups
+    "op_cycle": "--op-cycle",
+    "kick_early": "--kick-early",
+    "op_cycle_kick_early": "--op-cycle --kick-early",
+    # configuration changes of the supervisor (P3, 2026-10-20; --kick-early is
+    # the default from here on, `final` re-run):
+    #   uv run python -m bench.ablate --f 0.02 --every 2 \
+    #       --cells final,no_swap,restarts_2,pursue_2 \
+    #       --out results/p3_config/ablate_f0.02.csv          (and --f 0.1 --every 4)
+    #   uv run python -m bench.analyze_ablate --dir results/p3_config
+    "no_swap": "--ops 1,0,1,0,1,0.05",
+    "restarts_2": "--restarts 2",                      # control for pursue_2
+    "pursue_2": "--restarts 2 --pursue 0.5",           # 2 starts on T/4 each, best on T/2
+    # P3 follow-up (2026-10-21): wider schedule, gain grows with the budget in results/p3_starts
+    "decades_1.25": "--t-decades 1.25",
+    "decades_1.5": "--t-decades 1.5",
+    # P4 (2026-10-21): route elimination at the end (port of savant-elim.diff; F is a
+    # share of the budget, the starts get 1 - F). Tuning set only, never X (test set).
+    #   uv run python -m bench.ablate --f 0.02 --every 2 --cells final,elim_0.25,... \
+    #       --out results/p4_elim/ablate_f0.02.csv            (f 0.002 every 1, f 0.1 every 4)
+    #   uv run python -m bench.analyze_ablate --dir results/p4_elim
+    "elim_0.25": "--elim 0.25",                          # Nagata & Braysy in full, every level
+    "elim_0.25_lv0": "--elim 0.25 --elim-levels 0",      # ... re-anneal the last level only
+    "elim_0.1": "--elim 0.1",
+    "elim_0.5": "--elim 0.5",
+    "reanneal_0.25": "--elim 0.25 --elim-mode 0",        # control: the low-T re-anneal alone
+    # P4 A (2026-10-21): kick with repair (port of savant-kick-repair.diff); the
+    # supervisor advises a kick every 100 steps with it. Same commands, out
+    # results/p4_repair/ablate_f*.csv
+    "repair_1": "--kick-repair 1",
+    "repair_2": "--kick-repair 2",
+    "repair_1_k100": "--kick-repair 1 --kick 100",
+    "repair_2_k100": "--kick-repair 2 --kick 100",
 }
 
 
