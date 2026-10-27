@@ -144,8 +144,11 @@ The comparison of the paper ran on the Jean Zay supercomputer (IDRIS): CPU solve
 nodes of 2 x Intel Xeon Gold 6248, 40 concurrent runs per node, NDS on NVIDIA A100 GPUs,
 one run per GPU. `slurm/JEANZAY.md` gives the full procedure and `bench/slurm_campaign.py`
 generates the job files. The parameter study (`bench/sweep.py`, `bench/time_match.py`,
-`bench/interact.py`, `bench/ablate.py` and their `analyze_*` counterparts) ran on a
-single workstation. Each module documents its own usage in its docstring.
+`bench/interact.py`, `bench/ablate.py`) ran on a
+single workstation. `uv run python -m bench.make_paper` reanalyses all the result files (the
+parameter study against the frozen reference costs of `data/tuning/reference_costs.csv`, and
+the comparison) and writes every table and figure of the paper. Each module documents its own
+usage in its docstring.
 
 ## Results
 
