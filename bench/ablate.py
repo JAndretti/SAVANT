@@ -50,7 +50,7 @@ CELLS: dict[str, str] = {
     # Run with the sorted cw, `final` included, into results/p1_sorted_knn/:
     #   uv run python -m bench.ablate --f 0.02 --every 2 --cells final,knn_30,knn_30_vrank_2 \
     #       --out results/p1_sorted_knn/ablate_f0.02.csv        (and --f 0.1 --every 4)
-    #   uv run python -m bench.analyze_ablate --dir results/p1_sorted_knn
+    #   results in results/p1_sorted_knn
     "knn_30": "--sa-knn 30",
     "knn_30_vrank_2": "--sa-knn 30 --vrank 2",
     # speedups proposed in the October 2026 code review (2026-10-20), tested at equal time with the
@@ -58,7 +58,7 @@ CELLS: dict[str, str] = {
     #   uv run python -m bench.ablate --f 0.02 --every 2 \
     #       --cells final,op_cycle,kick_early,op_cycle_kick_early \
     #       --out results/p2_speedups/ablate_f0.02.csv        (and --f 0.1 --every 4)
-    #   uv run python -m bench.analyze_ablate --dir results/p2_speedups
+    #   results in results/p2_speedups
     "op_cycle": "--op-cycle",
     "kick_early": "--kick-early",
     "op_cycle_kick_early": "--op-cycle --kick-early",
@@ -67,7 +67,7 @@ CELLS: dict[str, str] = {
     #   uv run python -m bench.ablate --f 0.02 --every 2 \
     #       --cells final,no_swap,restarts_2,pursue_2 \
     #       --out results/p3_config/ablate_f0.02.csv          (and --f 0.1 --every 4)
-    #   uv run python -m bench.analyze_ablate --dir results/p3_config
+    #   results in results/p3_config
     "no_swap": "--ops 1,0,1,0,1,0.05",
     "restarts_2": "--restarts 2",                      # control for pursue_2
     "pursue_2": "--restarts 2 --pursue 0.5",           # 2 starts on T/4 each, best on T/2
@@ -78,7 +78,7 @@ CELLS: dict[str, str] = {
     # share of the budget, the starts get 1 - F). Tuning set only, never X (test set).
     #   uv run python -m bench.ablate --f 0.02 --every 2 --cells final,elim_0.25,... \
     #       --out results/p4_elim/ablate_f0.02.csv            (f 0.002 every 1, f 0.1 every 4)
-    #   uv run python -m bench.analyze_ablate --dir results/p4_elim
+    #   results in results/p4_elim
     "elim_0.25": "--elim 0.25",                          # Nagata & Braysy in full, every level
     "elim_0.25_lv0": "--elim 0.25 --elim-levels 0",      # ... re-anneal the last level only
     "elim_0.1": "--elim 0.1",
@@ -95,7 +95,7 @@ CELLS: dict[str, str] = {
     # 2020): the order in which removed customers are reinserted, and blinks.
     #   uv run python -m bench.ablate --f 0.02 --every 2 --cells final,order_random,... \
     #       --out results/p4_kick/ablate_f0.02.csv            (f 0.1 every 4 for survivors)
-    #   uv run python -m bench.analyze_ablate --dir results/p4_kick
+    #   results in results/p4_kick
     "order_random": "--kick-order 1",
     "order_demand": "--kick-order 2",
     "order_far": "--kick-order 3",

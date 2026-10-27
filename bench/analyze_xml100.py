@@ -13,11 +13,13 @@ least one run did not reach the optimum. It reports
     customer position, demand distribution, average route size), counted rather than
     averaged, so that one extreme instance cannot drive a whole attribute level;
   - the arcs of each optimal solution whose endpoints are not within each other's
-    K = 20 nearest customers, i.e. arcs SAVANT's candidate lists never propose;
+    K = 20 nearest customers (the lists guide SAVANT's proposals; they do not forbid
+    such arcs, SWAP* and the reconnections can create them);
   - with --knn: the control experiment, SAVANT with K = 20 against K = 40 on the
     instances it missed (same machine, same budget, 3 seeds; tags k20 and k40).
 
-Writes <set>/savant_diagnosis.csv and publication/paper/tables/xml100.tex.
+Writes <set>/savant_diagnosis.csv, which bench.make_paper reads to
+build the manuscript's table.
 """
 
 from __future__ import annotations
@@ -34,7 +36,6 @@ from scipy.stats import fisher_exact, wilcoxon
 from bench.common import DATA, ROOT, read_cvrplib_sol, read_vrp
 
 K = 20                                        # SAVANT's --sa-knn default
-TABLES = ROOT / "publication" / "paper" / "tables"
 SHORT = ("1", "2")                            # route-size codes: 3-5 and 5-8 customers per route
 
 
@@ -111,36 +112,6 @@ def knn_control(path: Path, f: pd.DataFrame) -> dict:
     return res
 
 
-def table(f: pd.DataFrame) -> None:
-    """Misses of each solver by the factors that matter, as counts."""
-    short = f.code.str[3].isin(SHORT)
-    out = f.opt_arcs_outside_K20 > 0
-    groups = [("All instances", pd.Series(True, index=f.index)),
-              (r"Routes of $3$--$8$ customers", short),
-              (r"Routes of $8$--$50$ customers", ~short),
-              (r"Unitary demands", f.code.str[2] == "1"),
-              (r"Optimal arc beyond rank $20$", out),
-              (r"All optimal arcs within rank $20$", ~out)]
-    lines = [r"\begin{table}[t]",
-             r"\caption{Instances of the XML100 test set on which a solver misses the optimum in at "
-             r"least one of its $10$ runs, by group. The last two rows split the instances by whether "
-             r"the optimal solution contains an arc whose endpoints are not among each other's $20$ "
-             r"nearest customers, an arc the candidate lists of \savant\ never propose.}\label{tab:xml}",
-             r"\begin{tabular*}{\tblwidth}{@{\extracolsep{\fill}}lrrr@{}}",
-             r"\toprule",
-             r"Group & Inst. & \savant & HGS \\",
-             r"\midrule"]
-    for label, m in groups:
-        lines.append(f"{label} & {int(m.sum())} & {int(f.savant_miss[m].sum())} & "
-                     f"{int(f.hgs_miss[m].sum())} \\\\")
-        if label.startswith("All") or label.startswith("Unitary"):
-            lines.append(r"\midrule")
-    lines += [r"\bottomrule", r"\end{tabular*}", r"\end{table}"]
-    TABLES.mkdir(parents=True, exist_ok=True)
-    (TABLES / "xml100.tex").write_text("\n".join(lines) + "\n")
-    print(f"\nwrote {TABLES / 'xml100.tex'}")
-
-
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--set", type=Path, default=ROOT / "results" / "jz" / "XML100_test")
@@ -163,7 +134,6 @@ def main() -> None:
               f"{int(f.savant_miss[~m].sum())}/{int((~m).sum())}, Fisher p = {fisher_exact(t).pvalue:.3g}")
     print("median largest rank used by the optimum: missed",
           f.max_rank[f.savant_miss].median(), "/ solved", f.max_rank[~f.savant_miss].median())
-    table(f)
     if a.knn:
         knn_control(a.knn, f)
 

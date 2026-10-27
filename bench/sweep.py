@@ -99,7 +99,7 @@ CONFIGS: dict[str, str] = {
 # sorted cw_repro, together with `default`, into results/p1_sorted_knn/:
 #   uv run python -m bench.sweep --budget 1e4 --configs default,vrank_2_knn30,saknn_30,vrank_2 \
 #       --out results/p1_sorted_knn/screen_B10000.csv          (same for 1e5, 1e6)
-# bench.analyze_sweep substitutes these rows for the old ones.
+# bench.make_paper substitutes these rows for the old ones.
 SORTED_KNN = {
     "vrank_2_knn30": CONFIGS["vrank_2_knn30"],
     "saknn_30": "--sa-knn 30",                   # control: the larger lists alone

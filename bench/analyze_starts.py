@@ -4,7 +4,7 @@ Runs come from `bench.sweep --base final --configs p3` (final configuration,
 cw defaults R = 4, D = 1). Quality of a run = gap (%) to the best cost known for
 its instance: the best feasible cost over all P3 runs at every budget, or the
 BKS when better. Each variant is compared to `final` on the same (instance, seed)
-pairs, as in bench.analyze_sweep (delta < 0 = better; p_holm = Wilcoxon,
+pairs (delta < 0 = better; p_holm = Wilcoxon on the pairs,
 Holm-corrected within a budget). The by-size table gives raw p-values: it is
 there to suggest a rule R(n, budget), not to prove one.
 
@@ -18,10 +18,29 @@ import numpy as np
 import pandas as pd
 from scipy.stats import wilcoxon
 
-from bench.analyze_sweep import holm, paired, size_group
-from bench.common import ROOT, load_bks
+from bench.common import ROOT, holm, load_bks
 
 DIR = ROOT / "results" / "p3_starts"
+
+
+def size_group(n: int) -> str:
+    if n <= 100:
+        return "n<=100"
+    if n <= 500:
+        return "n=200-500"
+    if n <= 1000:
+        return "n=600-1000"
+    return "n=2000"
+
+
+def paired(budget: str, tag: str, x: pd.DataFrame, base: pd.DataFrame) -> dict:
+    """x against base on the same (instance, seed) pairs; both indexed by them."""
+    j = base.index.intersection(x.index)
+    diff = x.gap[j] - base.gap[j]
+    p = wilcoxon(diff).pvalue if (diff != 0).any() else 1.0
+    return {"budget": budget, "tag": tag, "pairs": len(j), "gap": x.gap[j].mean(), "delta": diff.mean(),
+            "wins": int((diff < 0).sum()), "losses": int((diff > 0).sum()), "p": p,
+            "time_x": x.time_s[j].mean() / base.time_s[j].mean()}
 
 
 def main() -> None:

@@ -11,7 +11,7 @@ the script checks them with the independent checker and prints their gap, to be
 compared with the campaign's before the figure is used.
 
 Left: the optimal solution (CVRPLIB), its arcs whose endpoints are not among each
-other's 20 nearest customers in red -- arcs SAVANT's candidate lists never propose.
+other's 20 nearest customers in red (the lists guide proposals; they do not forbid such arcs).
 Right: SAVANT's solution, its customer-to-customer arcs absent from the optimal
 solution in blue. Depot arcs are always dotted grey (routes differ, so almost all
 of them would differ); customer size is proportional to demand.

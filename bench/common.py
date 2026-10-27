@@ -17,6 +17,8 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
+# the manuscript; publication/paper/archive/v1 holds the earlier version
+PAPER = ROOT / "publication" / "paper" / "v2"
 
 
 @dataclass
@@ -178,8 +180,7 @@ def physical_cpus() -> list[int]:
 
 
 def holm(p: np.ndarray) -> np.ndarray:
-    """Holm-Bonferroni adjusted p-values, in the order of `p`. (The Phase 2
-    analyses each carry their own copy; this one is for new code.)"""
+    """Holm-Bonferroni adjusted p-values, in the order of `p`."""
     order = np.argsort(p)
     adj, running = np.empty_like(p), 0.0
     for rank, i in enumerate(order):

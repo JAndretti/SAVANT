@@ -41,6 +41,11 @@ def cell_name(on: tuple[str, ...]) -> str:
     return "base" if not on else "x_" + "+".join(on)
 
 
+def factors_of(tag: str) -> frozenset[str]:
+    """Inverse of cell_name: the factors switched on in a cell."""
+    return frozenset() if tag == "base" else frozenset(tag[2:].split("+"))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     b = ap.add_mutually_exclusive_group(required=False)
