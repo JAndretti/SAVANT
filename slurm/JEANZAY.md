@@ -197,7 +197,7 @@ tar --zstd -xf savant_jz.tar.zst SAVANT_pub/external_code/NDS SAVANT_pub/externa
 On the login node (internet), then the A100 smoke test, **then check its log**:
 
 ```bash
-uv sync --project external_code/nds_env        # torch cu128 + numpy<2.4, pybind11<3 (see roadmap)
+uv sync --project external_code/nds_env        # torch cu128 + numpy<2.4, pybind11<3
 sbatch -A <project>@a100 slurm/nds_smoke.sbatch                  # 30 min max, qos_gpu_a100-dev
 # log: "NDS C++ operators built", torch ... True NVIDIA A100..., "all solutions valid",
 #      every line trace_ok: true

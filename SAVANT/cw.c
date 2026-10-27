@@ -217,7 +217,9 @@ typedef struct {
     int    sa_knn, check, split, split_every, split_tour;
     int    restarts, cw_rand, pick_t, pick_crit;
     int    op_cycle, kick_early;
-    int    kick_repair, repair_top, repair_k;   /* --kick-repair M, P4 A    */
+    int    kick_repair, repair_top, repair_k;   /* --kick-repair M          */
+    int    kick_order;      /* --kick-order M : reinsertion order         */
+    double kick_blink;      /* --kick-blink p : skip a position w.p. p      */
     int    pick2, vrank, reloc_side, pair;   /* new, all neutral by default */
     double race, race_at;                    /* racing between starts       */
     double pursue;                           /* --pursue F, 0 = off           */
@@ -562,6 +564,8 @@ typedef struct {
     long    *touch;          /* step at which each node last moved           */
     int      kick_max;       /* --kick-max                                   */
     int      kick_early, kick_repair, repair_top, repair_k;
+    int      kick_order;     /* --kick-order                                 */
+    double   kick_blink;     /* --kick-blink                                 */
     double  *kbuf;           /* --kick-repair: removal deltas of a route     */
     uint32_t *ktag, kick_gen; /* customers currently out, per kick generation */
     int     *pos;            /* position of a customer in the route buffer   */
@@ -1896,8 +1900,7 @@ static SPEC_INLINE double mv_2opt_impl(const Inst *in, WS *w, Sol *S, int K,
 
 #define KICK_MAXK 64
 /* journal: k removals + k insertions + 2 entries per repair move, and a
-   repair makes at most 3k moves (port of the supervisor's kick-repair.diff,
-   2026-10-21) */
+   repair makes at most 3k moves (2026-10-21) */
 #define KICK_JMAX (8 * KICK_MAXK)
 
 /* --kick-repair: the best move out of the overloaded route r found so far,
@@ -1976,6 +1979,36 @@ static double mv_kick(const Inst *in, WS *w, Sol *S, int K, double T, Rng *rng)
     }
     if (!nrem) return 0.0;
 
+    /* --kick-order: the order in which the removed customers are put
+       back, as in SISR. Removal order by default (no draw made). rc/rp move
+       together: rp[t] stays the former predecessor of rc[t]. */
+    if (w->kick_order && nrem > 1) {
+        int mode = w->kick_order;
+        if (mode == 5) {                         /* SISR weights 4:4:2:1 */
+            int x = rng_idx(rng, 11);
+            mode = (x < 4) ? 1 : (x < 8) ? 2 : (x < 10) ? 3 : 4;
+        }
+        if (mode == 1) {
+            for (int t = nrem - 1; t > 0; t--) {
+                int u = rng_idx(rng, t + 1);
+                int a = rc[t]; rc[t] = rc[u]; rc[u] = a;
+                a = rp[t]; rp[t] = rp[u]; rp[u] = a;
+            }
+        } else {                                 /* stable insertion sort */
+            double key[KICK_MAXK];
+            for (int t = 0; t < nrem; t++)
+                key[t] = (mode == 2) ? -in->dem[rc[t]]
+                       : (mode == 3) ? -dxy(w, 0, rc[t]) : dxy(w, 0, rc[t]);
+            for (int t = 1; t < nrem; t++) {
+                double k = key[t]; int c = rc[t], p = rp[t], u = t - 1;
+                while (u >= 0 && key[u] > k) {
+                    key[u + 1] = key[u]; rc[u + 1] = rc[u]; rp[u + 1] = rp[u]; u--;
+                }
+                key[u + 1] = k; rc[u + 1] = c; rp[u + 1] = p;
+            }
+        }
+    }
+
     /* --- recreate: cheapest insertion among each customer's kNN, feasible
        only with --kick-repair 0 --- */
     const int repair = (K > 0) ? w->kick_repair : 0;
@@ -1987,7 +2020,7 @@ static double mv_kick(const Inst *in, WS *w, Sol *S, int K, double T, Rng *rng)
        once the partial delta exceeds the threshold by more than the slack
        still available, the kick is lost and is abandoned early. Exact with
        --kick-repair 0; with a repair, which may still lower the delta, the
-       abandon is an approximation (the supervisor measured that it pays). */
+       abandon is an approximation, which was measured to pay off). */
     const double slack = in->rounded ? 1.0 : 1e-9;
     const double thr = (w->kick_early && T > 0.0) ? -T * log(1.0 - rng_unit(rng)) : 0.0;
     int over[KICK_MAXK], nover = 0;              /* routes that received a customer */
@@ -2006,6 +2039,9 @@ static double mv_kick(const Inst *in, WS *w, Sol *S, int K, double T, Rng *rng)
                             : 1 + rng_idx(rng, n);
             if (v < 1) continue;
             if (v <= n && w->ktag[v] == gen) continue;     /* itself removed */
+            /* --kick-blink: skip a kNN position w.p. p (the former
+               predecessor, e = -1, is never skipped: it is the fallback) */
+            if (w->kick_blink > 0.0 && e >= 0 && rng_unit(rng) < w->kick_blink) continue;
             int r = rid[v];
             if (r < 0 || r >= S->R) continue;
             if (!repair && S->load[r] + in->dem[c] > in->cap + EPS) continue;
@@ -2503,6 +2539,7 @@ static int sa_config(const Inst *in, WS *w, const Opts *o, int n, int R,
     w->kick_max = o->kick_max;
     w->kick_early = o->kick_early;
     w->kick_repair = o->kick_repair; w->repair_top = o->repair_top; w->repair_k = o->repair_k;
+    w->kick_order = o->kick_order; w->kick_blink = o->kick_blink;
     w->feat = (o->dlb > 0 ? 1 : 0) | (w->empty_thr ? 2 : 0);
     return K;
 }
@@ -2800,8 +2837,7 @@ static double chain_finish(const Inst *in, WS *w, Chain *c)
  *  best feasible position. The attempt fails after --elim-iter * n
  *  insertions, or when no route is left below the bound ceil(sum q / Q).
  *
- *  Ported from the supervisor's savant-elim.diff (2026-10-21), with one
- *  change: F is a share of the budget, as for --pursue, so the total stays
+ *  F is a share of the budget, as for --pursue, so the total stays
  *  that of the run. The starts get (1-F) S steps each (or 1-F of --sa-wall),
  *  and the phase F R S steps (or the time left), shared equally by the
  *  re-annealed levels. They start from the solution with one route fewer
@@ -3650,7 +3686,7 @@ static void restart_run(const Inst *in, WS *w, const Opts *o, int rs,
 
 /* --sa-steps N -- the budget from the instance's own dimension.
  *
- * `timing/report.md` measures where the mean cost stops improving: over
+ * An earlier timing study measured where the mean cost stops improving: over
  * 8 sizes x 11 budgets x 15 instances of the generated family, the budget that
  * reaches within 1 % of converged grows as a*n^g with a = 668, g = 1.37. That
  * is faster than linear -- ten times the customers wants about twenty-three
@@ -4171,8 +4207,8 @@ static void usage(void)
 "  --sa-steps K       number of steps              (default 1000)\n"
 "  --sa-steps N       ...or the literal letter N: the budget is then set per\n"
 "                     instance from its own dimension, max(500000, 668*n^1.37)\n"
-"                     -- the rule timing/report.md fits for reaching within\n"
-"                     1 %% of converged, with a floor under it because the fit\n"
+"                     -- the rule an earlier timing study fits for reaching\n"
+"                     within 1 %% of converged, with a floor under it as the fit\n"
 "                     under-predicts at the small end and the annealing's own\n"
 "                     setup is not free. The floor binds below n ~ 125.\n"
 "                     Use it on a set whose sizes differ; a single count\n"
@@ -4328,6 +4364,13 @@ static void usage(void)
 "  --repair-top T     M = 2: the customers of the route are taken by\n"
 "                     decreasing detour until T have a feasible move (4)\n"
 "  --repair-k K       M = 2: moves tried next to the K nearest neighbours (10)\n"
+"  --kick-order M     kick reinsertion order: 0 = order of removal (default);\n"
+"                     1 = random; 2 = decreasing demand; 3 = farthest from the\n"
+"                     depot first; 4 = closest first; 5 = one of 1-4 drawn per\n"
+"                     kick with weights 4:4:2:1 (SISR, Christiaens & Vanden\n"
+"                     Berghe 2020)\n"
+"  --kick-blink p     kick reinsertion: each candidate position is skipped with\n"
+"                     probability p (SISR blinks, e.g. 0.01; default 0)\n"
 "  --kick-early       kick: Metropolis threshold drawn first, the kick is\n"
 "                     abandoned as soon as it is lost; same acceptance law,\n"
 "                     another random stream (default on)\n"
@@ -4393,6 +4436,7 @@ int main(int argc, char **argv)
     o.sa_steps = 1000; o.sa_t0 = -1.0; o.sa_tend = -1.0; o.sa_chi0 = 0.001;
     o.sa_decades = 1.0;
     o.kick_repair = 0; o.repair_top = 4; o.repair_k = 10;
+    o.kick_order = 0; o.kick_blink = 0.0;
     o.elim_frac = 0.0; o.elim_mode = 3; o.elim_sigma = 5.0; o.elim_thi = 3.0;
     o.elim_thi2 = 10.0; o.elim_iter = 5.0; o.elim_kmax = 3; o.elim_max = 5;
     o.elim_perturb = 100; o.elim_tp = 0.0; o.elim_ej = 1; o.elim_levels = 1; o.split = 0; o.split_every = 0; o.split_tour = 2;
@@ -4501,6 +4545,8 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--kick-repair"))  o.kick_repair = (int)opt_int(a, NEXT());
         else if (!strcmp(a, "--repair-top"))   o.repair_top = (int)opt_int(a, NEXT());
         else if (!strcmp(a, "--repair-k"))     o.repair_k = (int)opt_int(a, NEXT());
+        else if (!strcmp(a, "--kick-order"))   o.kick_order = (int)opt_int(a, NEXT());
+        else if (!strcmp(a, "--kick-blink"))   o.kick_blink = opt_num(a, NEXT());
         else if (!strcmp(a, "--elim"))         o.elim_frac = opt_num(a, NEXT());
         else if (!strcmp(a, "--elim-mode"))    o.elim_mode = (int)opt_int(a, NEXT());
         else if (!strcmp(a, "--elim-sigma"))   o.elim_sigma = opt_num(a, NEXT());
@@ -4625,6 +4671,8 @@ int main(int argc, char **argv)
     if (o.kick_repair < 0 || o.kick_repair > 2) die("--kick-repair: 0, 1 or 2");
     if (o.repair_top < 1) die("--repair-top: at least 1");
     if (o.repair_k < 1) die("--repair-k: at least 1");
+    if (o.kick_order < 0 || o.kick_order > 5) die("--kick-order: 0 to 5");
+    if (o.kick_blink < 0.0 || o.kick_blink >= 1.0) die("--kick-blink: a probability in [0, 1)");
     if (o.dlb < 0) die("--dlb: rejections before a vertex goes quiet, 0 = off");
     if (o.t0_trim < 0.0 || o.t0_trim >= 1.0) die("--t0-trim: 0 <= F < 1");
 
@@ -4759,6 +4807,9 @@ int main(int argc, char **argv)
         if (o.kick_every > 0)
             printf("# kick       : ruin & recreate every %d steps, up to %d "
                    "customers\n", o.kick_every, o.kick_max);
+        if (o.kick_every > 0 && (o.kick_order || o.kick_blink > 0.0))
+            printf("# kick       : reinsertion order %d, blink probability %g\n",
+                   o.kick_order, o.kick_blink);
         if (o.elim_frac > 0.0)
             printf("# elimination: mode %d, then a re-anneal on %g of the budget, "
                    "at low temperature\n", o.elim_mode, o.elim_frac);

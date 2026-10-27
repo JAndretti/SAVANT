@@ -6,26 +6,36 @@ one exists. Configurations are compared with `default` on the same
 (instance, seed) pairs, two-sided Wilcoxon signed-rank.
 
     uv run python -m bench.analyze_timematch
+    uv run python -m bench.analyze_timematch --dir results/v2_params
+analyses the timematch_f*.csv of that directory and writes its summary there;
+the reference costs then pool every run of that directory and of results/phase2.
 """
 
 from __future__ import annotations
+
+import argparse
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from scipy.stats import wilcoxon
 
-from bench.common import ROOT, load_bks
+from bench.common import ROOT, load_bks, run_csvs
 
 OUT = ROOT / "results" / "phase2"
 
 
 def main() -> None:
-    tm_files = sorted(OUT.glob("timematch_f*.csv"))
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--dir", type=Path, default=OUT, help="directory of the timematch_f*.csv files")
+    src = ROOT / ap.parse_args().dir
+    tm_files = sorted(src.glob("timematch_f*.csv"))
     if not tm_files:
         raise SystemExit("no time-matched results yet")
     tm = pd.concat([pd.read_csv(f) for f in tm_files], ignore_index=True)
-    allr = pd.concat([tm] + [pd.read_csv(f) for f in sorted(OUT.glob("screen_B*.csv"))],
-                     ignore_index=True)
+    others = sorted(OUT.glob("screen_B*.csv")) if src == OUT else \
+        [f for f in run_csvs(src) + run_csvs(OUT) if f not in tm_files]
+    allr = pd.concat([tm] + [pd.read_csv(f) for f in others], ignore_index=True)
     bad = tm[tm.feasible != 1]
     if len(bad):
         print(f"WARNING: {len(bad)} infeasible runs excluded")
@@ -58,7 +68,8 @@ def main() -> None:
             print(f"{tag:20s} gap {r['gap']:.4f}  delta {r['delta']:+.4f}  "
                   f"wins {r['wins']}  losses {r['losses']}  p {r['p']:.3g}  "
                   f"steps x{r['steps_x']:.2f}  time x{r['time_x']:.3f}")
-    pd.DataFrame(rows).to_csv(OUT / "timematch_summary.csv", index=False)
+    pd.DataFrame(rows).to_csv(src / "timematch_summary.csv", index=False)
+    print(f"\nwrote {src / 'timematch_summary.csv'}")
 
 
 if __name__ == "__main__":

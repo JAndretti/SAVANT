@@ -9,7 +9,7 @@ that much. Holm correction within a budget.
 writes results/phase2/ablate_summary.csv
     uv run python -m bench.analyze_ablate --dir results/p1_sorted_knn
 analyses the ablate_f*.csv of that directory instead and writes its summary
-there; the reference costs still include every run of results/phase2.
+there; the reference costs then pool every run of that directory and of results/phase2.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 from scipy.stats import wilcoxon
 
-from bench.common import ROOT, load_bks
+from bench.common import ROOT, load_bks, run_csvs
 
 OUT = ROOT / "results" / "phase2"
 
@@ -44,8 +44,8 @@ def main() -> None:
         raise SystemExit("no ablation results yet")
     df = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
     others = sorted(OUT.glob("screen_B*.csv")) + sorted(OUT.glob("timematch_f*.csv")) \
-        + [f for f in OUT.glob("interact_*.csv") if "summary" not in f.name] \
-        + ([f for f in OUT.glob("ablate_f*.csv") if "summary" not in f.name] if src != OUT else [])
+        + [f for f in OUT.glob("interact_*.csv") if "summary" not in f.name] if src == OUT \
+        else [f for f in run_csvs(src) + run_csvs(OUT) if f not in files]
     allr = pd.concat([df] + [pd.read_csv(f) for f in others], ignore_index=True)
     if (df.feasible != 1).any():
         print(f"WARNING: {int((df.feasible != 1).sum())} infeasible runs excluded")

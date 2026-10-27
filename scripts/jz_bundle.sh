@@ -19,7 +19,8 @@ R=$STAGE/SAVANT_pub
 mkdir -p "$R"
 
 # --- our code -------------------------------------------------------------
-cp -r SAVANT bench slurm scripts Makefile pyproject.toml uv.lock .python-version roadmap.md "$R"/
+cp -r SAVANT bench slurm scripts Makefile pyproject.toml uv.lock .python-version "$R"/
+[ -f roadmap.md ] && cp roadmap.md "$R"/      # our notes, not published
 find "$R" -name '__pycache__' -prune -exec rm -rf {} +
 mkdir -p "$R/results/jz" "$R/slurm/logs"
 

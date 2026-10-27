@@ -15,17 +15,22 @@ gap (%) to the best cost known for the instance:
 
     uv run python -m bench.analyze_interact
 writes results/phase2/interact_summary.csv
+    uv run python -m bench.analyze_interact --dir results/v2_params
+analyses the interact_*.csv of that directory and writes its summary there;
+the reference costs then pool every run of that directory and of results/phase2.
 """
 
 from __future__ import annotations
 
+import argparse
 import itertools
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from scipy.stats import wilcoxon
 
-from bench.common import ROOT, load_bks
+from bench.common import ROOT, load_bks, run_csvs
 from bench.interact import FACTORS, cell_name
 
 OUT = ROOT / "results" / "phase2"
@@ -53,14 +58,17 @@ def paired(a: pd.DataFrame, b: pd.DataFrame) -> tuple[pd.Series, float]:
 
 
 def main() -> None:
-    files = sorted(OUT.glob("interact_*.csv"))
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--dir", type=Path, default=OUT, help="directory of the interact_*.csv files")
+    src = ROOT / ap.parse_args().dir
+    files = sorted(src.glob("interact_*.csv"))
     files = [f for f in files if "summary" not in f.name]
     if not files:
         raise SystemExit("no interaction results yet")
     df = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
-    allr = pd.concat([df] + [pd.read_csv(f) for f in
-                             sorted(OUT.glob("screen_B*.csv")) + sorted(OUT.glob("timematch_f*.csv"))],
-                     ignore_index=True)
+    others = sorted(OUT.glob("screen_B*.csv")) + sorted(OUT.glob("timematch_f*.csv")) if src == OUT \
+        else [f for f in run_csvs(src) + run_csvs(OUT) if f not in files]
+    allr = pd.concat([df] + [pd.read_csv(f) for f in others], ignore_index=True)
     if (df.feasible != 1).any():
         print(f"WARNING: {int((df.feasible != 1).sum())} infeasible runs excluded")
     df = df[df.feasible == 1].copy()
@@ -131,8 +139,8 @@ def main() -> None:
                 rows.append(pd.DataFrame([{"budget": budget, "view": "interaction",
                                            "name": f"{f}x{g}", "delta": inter}]))
 
-    pd.concat(rows, ignore_index=True).to_csv(OUT / "interact_summary.csv", index=False)
-    print(f"\nwrote {OUT / 'interact_summary.csv'}")
+    pd.concat(rows, ignore_index=True).to_csv(src / "interact_summary.csv", index=False)
+    print(f"\nwrote {src / 'interact_summary.csv'}")
 
 
 if __name__ == "__main__":

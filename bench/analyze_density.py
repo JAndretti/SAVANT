@@ -1,4 +1,4 @@
-"""How much do concurrent runs on one node slow each other down? (roadmap B2)
+"""How much do concurrent runs on one node slow each other down?
 
     uv run python -m bench.analyze_density --csv results/jz/density.csv
 
@@ -74,7 +74,7 @@ def main() -> None:
     print(paired.groupby(level="set").mean().to_string(float_format=lambda v: f"{v:.1f}"))
 
     top = rel.columns.max()
-    print(f"\nDecision rule (roadmap B2): keep {top} runs per node if the slowdown there is "
+    print(f"\nDecision rule: keep {top} runs per node if the slowdown there is "
           f"small (< ~5%), otherwise regenerate the campaigns with --jobs 20.")
     for s, g in rel.groupby(level="set"):
         print(f"  {s:3s} at {top} runs: {100 * (g[top].mean() - 1):+.1f}% mean, "

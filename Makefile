@@ -53,7 +53,16 @@ debug: $(SRC)
 check: $(SRC)
 	$(CC) $(CFLAGS) -ffp-contract=off -DCW_CHECK $(OMP) -o cw_check $< $(LDFLAGS)
 
+# minimal version: the configuration of the paper only (SAVANT/savant.c),
+# same solutions as cw with its defaults; savant_repro as cw_repro
+MIN := SAVANT/savant.c
+savant: $(MIN)
+	$(CC) $(CFLAGS) $(OMP) -o $@ $< $(LDFLAGS)
+
+savant_repro: $(MIN)
+	$(CC) $(CFLAGS) -ffp-contract=off $(OMP) -o $@ $< $(LDFLAGS)
+
 clean:
-	rm -f cw cw_repro cw_dbg cw_check
+	rm -f cw cw_repro cw_dbg cw_check savant savant_repro
 
 .PHONY: all auto repro macos serial debug check clean

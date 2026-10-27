@@ -137,6 +137,12 @@ def read_cwsol(path: str | Path) -> dict[str, tuple[float, list[list[int]]]]:
     return out
 
 
+def run_csvs(d: Path) -> list[Path]:
+    """Every per-run CSV of a parameter-study directory (summaries excluded)."""
+    pats = ("screen_B*.csv", "timematch_f*.csv", "interact_*.csv", "ablate_f*.csv")
+    return sorted(f for p in pats for f in d.glob(p) if "summary" not in f.name)
+
+
 def load_bks() -> dict[str, float]:
     bks: dict[str, float] = {}
     for f in (DATA / "cvrplib").glob("*_bks.csv"):

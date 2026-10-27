@@ -2,6 +2,9 @@
 
     uv run python -m bench.analyze_sweep     # refresh results/phase2/screen_summary.csv
     uv run python -m bench.make_tables       # -> publication/paper/tables/screening.tex
+    uv run python -m bench.make_tables --param-dir results/v2_params
+        # timematch, interactions and ablation from that directory's summaries
+        # (the screening always reads results/phase2)
 """
 
 from __future__ import annotations
@@ -566,9 +569,13 @@ if __name__ == "__main__":
     ap.add_argument("--compare", type=Path, help="directory analysed by bench.analyze_compare")
     ap.add_argument("--name", help="suffix of the .tex files, e.g. X")
     ap.add_argument("--caption", default=None, help="how the set is named in the caption")
+    ap.add_argument("--param-dir", type=Path, default=None,
+                    help="summaries of timematch, interactions and ablation (default results/phase2)")
     ap.add_argument("--group", nargs="+", metavar="DIR=LABEL",
                     help="several analysed directories in one table (with --name and --caption)")
     a = ap.parse_args()
+    if a.param_dir is not None:
+        OUT_DIR = ROOT / a.param_dir
     if a.group:
         if not (a.name and a.caption):
             ap.error("--group needs --name and --caption")

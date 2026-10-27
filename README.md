@@ -8,15 +8,16 @@ Code, benchmark harness and experimental protocol of
 
 SAVANT builds an initial solution with the parallel savings heuristic (Clarke & Wright)
 and improves it by simulated annealing over six neighbourhoods restricted to truncated
-candidate lists, including a sampled SWAP\* and a periodic ruin-and-recreate move, with a
-few restarts separated by an optimal Split. It is a single C file with no dependency.
+candidate lists, including a sampled SWAP\* and a periodic ruin-and-recreate move, from four
+independent starts. It is a single C file with no dependency.
 
 ## Repository layout
 
 | Path | Content |
 |---|---|
-| `SAVANT/cw.c` | the solver |
-| `Makefile` | builds `cw` (fast) and `cw_repro` (bit-reproducible) |
+| `SAVANT/cw.c` | the solver, research version: the configuration of the paper by default, and every variant studied behind an option |
+| `SAVANT/savant.c` | the solver, minimal version: the configuration of the paper only (about a third of the code), same solutions as `cw` |
+| `Makefile` | builds `cw` (fast) and `cw_repro` (bit-reproducible), and the same for `savant` |
 | `bench/` | benchmark harness: runners for every solver, independent solution checker, parameter study, analyses, tables and figures of the paper |
 | `slurm/` | the Slurm jobs of the comparison on the Jean Zay supercomputer, and `JEANZAY.md`, the full procedure |
 | `scripts/` | generation of the campaign files and of the archive copied to the cluster |
@@ -33,6 +34,12 @@ make repro      # cw_repro: no FMA contraction, bit-identical results across bui
 make auto       # picks what the machine supports (macOS: Homebrew libomp, or serial)
 ./cw --help
 ```
+
+`make savant` builds the minimal version, `savant`, which takes the same `--dir`, `--round`,
+`--sa-steps`, `--sa-wall`, `--seed`, `--sol`, `--trace`, `--threads` and `-q` options and writes
+the same solution file (`./savant --help`). Built without FMA contraction (`make savant_repro`,
+like `cw_repro`), it returns the same solutions as `cw_repro` bit for bit; it runs about 10 %
+more annealing steps per second, having none of the optional mechanisms to test.
 
 Quick start on the X instances of CVRPLIB: download them, then solve every instance for
 60 seconds with the configuration of the paper (it is the compiled default) and integer
@@ -63,7 +70,7 @@ directory are solved in parallel, one per core (`--threads 1` to solve them one 
 No other option is needed: the configuration selected in the paper is compiled in as the
 default --- savings construction, simulated annealing with candidate lists of the 20 nearest
 customers (`--sa-knn 20`), uniform selection of the vertices a move acts upon
-(`--pick 1 --pick2 1`), 4 restarts separated by an optimal Split (`--restarts 4`), and a
+(`--pick 1 --pick2 1`), 4 independent restarts (`--restarts 4`), and a
 ruin-and-recreate move every 50 steps removing up to 20 customers (`--kick 50 --kick-max 20`).
 
 ## Reproducing the experiments
